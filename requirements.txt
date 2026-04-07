@@ -1,0 +1,28 @@
+# ==============================================================================
+# MASC-CSC 依赖锁定文件
+# ==============================================================================
+# 安装方式:
+#   方式一（推荐，CUDA 11.8）:
+#     pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
+#     pip install -r requirements.txt
+#
+#   方式二（CUDA 12.1）:
+#     pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121
+#     pip install -r requirements.txt
+# ==============================================================================
+
+# ── 核心训练框架 ──
+lightning==2.2.1
+transformers==4.40.0
+numpy<2
+tensorboard
+
+# ── NLP 工具 ──
+pypinyin
+
+# ── LLM 本地推理与 LoRA 微调（可选） ──
+peft>=0.7.0,<0.12.0
+trl==0.8.6
+accelerate>=0.25.0,<1.0.0
+bitsandbytes>=0.41.0,<0.43.0
+datasets
