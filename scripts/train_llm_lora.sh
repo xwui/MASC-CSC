@@ -2,7 +2,7 @@
 # ===============================================================================
 # train_llm_lora.sh
 # 验证器大模型 (LLM Verifier) LoRA 参数高效微调脚本
-# 推荐基座：Qwen2.5-0.5B-Instruct
+# 推荐基座：Qwen2.5-7B-Instruct
 # 默认训练数据：datasets/cscd-ns/train.jsonl
 # ===============================================================================
 
@@ -18,11 +18,12 @@ if [ -x "${DEFAULT_PYTHON}" ]; then
 else
     PYTHON_BIN="${PYTHON_BIN:-python}"
 fi
+TORCHRUN_PYTHON="${TORCHRUN_PYTHON:-${PYTHON_BIN}}"
 
 MIN_FREE_GB="${MIN_FREE_GB:-4}"
-MODEL_PATH="${MODEL_PATH:-./LLM/Qwen2.5-0.5B-Instruct}"
-DATA_PATH="${DATA_PATH:-./datasets/cscd-ns/train.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-./ckpt/llm_lora_qwen25_05b}"
+MODEL_PATH="${MODEL_PATH:-./LLM/Qwen2.5-7B-Instruct}"
+DATA_PATH="${DATA_PATH:-./datasets/cscd-ns/train.jsonl,./datasets/Sighan,./datasets/Lemon,./datasets/Wang271k}"
+OUTPUT_DIR="${OUTPUT_DIR:-./ckpt/llm_lora_qwen25_7b}"
 NV_CUSPARSE="/home/bkai/anaconda3/envs/cwq_masc_csc/lib/python3.10/site-packages/nvidia/cusparse/lib"
 NV_CUDART="/home/bkai/anaconda3/envs/cwq_masc_csc/lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
 export LD_LIBRARY_PATH="/home/bkai/anaconda3/envs/cwq_masc_csc/lib/:${NV_CUSPARSE}:${NV_CUDART}:${LD_LIBRARY_PATH:-}"
@@ -129,58 +130,7 @@ if nonempty == 0:
 PY
 }
 
-select_gpu() {
-    if ! command -v nvidia-smi >/dev/null 2>&1; then
-        echo "❌ 缺少 nvidia-smi，无法安全确认空闲 GPU；为避免影响其他任务，本次不启动训练。" >&2
-        exit 1
-    fi
 
-    MIN_FREE_GB="$MIN_FREE_GB" "$PYTHON_BIN" - <<'PY'
-import os
-import subprocess
-import sys
-
-min_free_gb = float(os.environ["MIN_FREE_GB"])
-min_free_mb = min_free_gb * 1024
-
-
-def run_query(args):
-    proc = subprocess.run(args, check=False, capture_output=True, text=True)
-    if proc.returncode != 0:
-        return []
-    return [line.strip() for line in proc.stdout.strip().splitlines() if line.strip()]
-
-
-gpus = []
-for line in run_query(["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"]):
-    parts = [p.strip() for p in line.split(',')]
-    if len(parts) != 2:
-        continue
-    gpus.append((parts[0], float(parts[1])))
-
-if not gpus:
-    sys.exit(1)
-
-uuid_to_idx = {}
-for row in run_query(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader,nounits"]):
-    parts = [p.strip() for p in row.split(',')]
-    if len(parts) == 2:
-        uuid_to_idx[parts[1]] = parts[0]
-
-busy = set()
-for row in run_query(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"]):
-    parts = [p.strip() for p in row.split(',')]
-    if len(parts) >= 2 and parts[0] in uuid_to_idx:
-        busy.add(uuid_to_idx[parts[0]])
-
-candidates = [(idx, free_mb) for idx, free_mb in gpus if idx not in busy and free_mb >= min_free_mb]
-if not candidates:
-    sys.exit(1)
-
-candidates.sort(key=lambda item: item[1], reverse=True)
-print(candidates[0][0])
-PY
-}
 
 echo "╔══════════════════════════════════════════════════════╗"
 echo "║          MASC-CSC | LLM Verifier LoRA 微调            ║"
@@ -193,50 +143,72 @@ validate_runtime
 echo "✅ 依赖、模型文件和训练数据预检通过。"
 echo "👉 模型位置: ${MODEL_PATH}"
 echo "👉 数据路径: ${DATA_PATH}"
-echo "👉 仅会选择没有现有计算进程、且空闲显存 >= ${MIN_FREE_GB}GB 的 GPU。"
+NUM_GPUS="${NUM_GPUS:-4}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+RUN_MODE="${RUN_MODE:-train}"   # train / preflight
 
-SELECTED_GPU="$(select_gpu || true)"
-if [ -z "${SELECTED_GPU}" ]; then
-    echo "❌ 没有找到满足条件的空闲 GPU。为了避免影响其他任务，本次不启动训练。"
-    exit 1
+PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
+GRAD_ACC_STEPS="${GRAD_ACC_STEPS:-32}"
+LEARNING_RATE="${LEARNING_RATE:-5e-5}"  #change to 1e-4 for qwen2.5-0.5b, 5e-5 for qwen2.5-7b
+MAX_ERROR_TO_CLEAN_RATIO="${MAX_ERROR_TO_CLEAN_RATIO:-1.0}"
+NUM_EPOCHS="${NUM_EPOCHS:-8}"
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-384}"
+LOGGING_STEPS="${LOGGING_STEPS:-10}"
+SAVE_STEPS="${SAVE_STEPS:-100}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
+LORA_R="${LORA_R:-16}" 
+LORA_ALPHA="${LORA_ALPHA:-32}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
+LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-cosine}"
+BF16="${BF16:-1}"
+
+export CUDA_VISIBLE_DEVICES
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export TOKENIZERS_PARALLELISM=false
+export NCCL_ASYNC_ERROR_HANDLING=1
+
+COMMON_ARGS=(
+    --model_name_or_path "${MODEL_PATH}"
+    --data_path "${DATA_PATH}"
+    --output_dir "${OUTPUT_DIR}"
+    --use_4bit
+    --per_device_train_batch_size "${PER_DEVICE_BATCH_SIZE}"
+    --gradient_accumulation_steps "${GRAD_ACC_STEPS}"
+    --learning_rate "${LEARNING_RATE}"
+    --max_error_to_clean_ratio "${MAX_ERROR_TO_CLEAN_RATIO}"
+    --num_train_epochs "${NUM_EPOCHS}"
+    --lora_r "${LORA_R}"
+    --lora_alpha "${LORA_ALPHA}"
+    --lora_dropout "${LORA_DROPOUT}"
+    --logging_steps "${LOGGING_STEPS}"
+    --save_steps "${SAVE_STEPS}"
+    --max_seq_length "${MAX_SEQ_LENGTH}"
+    --dataloader_num_workers "${DATALOADER_NUM_WORKERS}"
+    --warmup_ratio "${WARMUP_RATIO}"
+    --lr_scheduler_type "${LR_SCHEDULER_TYPE}"
+)
+
+if [ "${BF16}" = "1" ]; then
+    COMMON_ARGS+=(--bf16)
 fi
 
-export CUDA_VISIBLE_DEVICES="${SELECTED_GPU}"
-export CUDA_DEVICE_ORDER=PCI_BUS_ID
+if [ "${RUN_MODE}" = "preflight" ]; then
+    COMMON_ARGS+=(--preflight_only)
+fi
 
-echo "👉 已选择 GPU: ${SELECTED_GPU}"
-echo "👉 执行一次模型与 Trainer 初始化预检..."
+if [ "${NUM_GPUS}" = "1" ]; then
+    "${PYTHON_BIN}" scripts/train_llm_lora.py \
+        "${COMMON_ARGS[@]}"
+else
+    "${TORCHRUN_PYTHON}" -m torch.distributed.run \
+        --nproc_per_node="${NUM_GPUS}" \
+        --master_port="${MASTER_PORT}" \
+        scripts/train_llm_lora.py \
+        "${COMMON_ARGS[@]}"
+fi
 
-nice -n 10 "$PYTHON_BIN" scripts/train_llm_lora.py \
-    --model_name_or_path "${MODEL_PATH}" \
-    --data_path "${DATA_PATH}" \
-    --output_dir "${OUTPUT_DIR}" \
-    --use_4bit \
-    --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 8 \
-    --learning_rate 1e-4 \
-    --num_train_epochs 3 \
-    --lora_r 16 \
-    --lora_alpha 32 \
-    --logging_steps 5 \
-    --max_seq_length 384 \
-    --preflight_only
-
-echo "👉 预检通过，开始正式训练。"
-
-nice -n 10 "$PYTHON_BIN" scripts/train_llm_lora.py \
-    --model_name_or_path "${MODEL_PATH}" \
-    --data_path "${DATA_PATH}" \
-    --output_dir "${OUTPUT_DIR}" \
-    --use_4bit \
-    --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 8 \
-    --learning_rate 1e-4 \
-    --num_train_epochs 3 \
-    --lora_r 16 \
-    --lora_alpha 32 \
-    --logging_steps 5 \
-    --max_seq_length 384
 
 echo ""
 echo "🎉 LoRA 训练结束！最终微调权重已存入: ${OUTPUT_DIR}"
