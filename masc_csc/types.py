@@ -67,6 +67,8 @@ class CandidateSentence:
 class RouterDecision:
     invoke_llm: bool
     risk_score: float
+    use_supplement_mode: bool = False
+    supplement_positions: List[int] = field(default_factory=list)
     reasons: List[str] = field(default_factory=list)
 
 

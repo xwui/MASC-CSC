@@ -1,6 +1,32 @@
+"""
+MASC-CSC Router
+================
+路由器模块：决定是否需要调用 LLM 进行验证。
+
+包含两种实现：
+- HeuristicRouter: 基于人工阈值的启发式路由（原始版本，Baseline）
+- MLPRouter: 基于可学习 MLP 的自适应路由（改进版本）
+"""
+
+from typing import List, Optional
+
+import torch
+import torch.nn as nn
+
 from masc_csc.types import ErrorMechanism, PositionPrediction, RouterDecision, SentencePrediction
 
-class RiskAwareRouter:
+
+# ──────────────────────────────────────────────────────────
+# 1. 启发式路由器（原始版本，保留用于 Baseline 对比）
+# ──────────────────────────────────────────────────────────
+
+class HeuristicRouter:
+    """
+    基于人工阈值的启发式路由器。
+    通过位置级风险评分 → 句子级聚合 → 阈值截断来决定是否调用 LLM。
+    保留原始逻辑不变，作为消融实验的 Baseline。
+    """
+
     def __init__(
             self,
             detection_threshold: float = 0.35,
@@ -173,3 +199,145 @@ class RiskAwareRouter:
             risk_score=sentence_risk,
             reasons=reasons,
         )
+
+
+# ──────────────────────────────────────────────────────────
+# 2. 可学习 MLP 路由器（改进版本）
+# ──────────────────────────────────────────────────────────
+
+# 特征维度定义
+_FEATURE_DIM = 10
+
+
+def extract_features(prediction: SentencePrediction) -> torch.Tensor:
+    """
+    从 SentencePrediction 中提取固定维度的特征向量，供 MLP 路由器使用。
+
+    提取的 10 维特征：
+    [0] max_detection_score   - 所有位置中最大的检测分
+    [1] mean_detection_score  - 所有位置检测分的均值
+    [2] max_uncertainty       - 所有位置中最大的不确定度
+    [3] mean_uncertainty      - 所有位置不确定度的均值
+    [4] min_margin            - 所有位置中最小的 margin（top1-top2 概率差）
+    [5] num_edited_ratio      - 被编辑位置数 / 总位置数
+    [6] num_uncertain_mech    - 机制为 UNCERTAIN 的位置占比
+    [7] num_phono_mech        - 机制为 PHONOLOGICAL 的位置占比
+    [8] num_visual_mech       - 机制为 VISUAL 的位置占比
+    [9] sentence_length_norm  - 句子长度归一化 (len / 128)
+    """
+    positions = prediction.positions
+    if not positions:
+        return torch.zeros(_FEATURE_DIM)
+
+    detection_scores = [p.detection_score for p in positions]
+    uncertainties = [p.uncertainty for p in positions]
+    margins = [p.margin for p in positions]
+    n = len(positions)
+
+    num_edited = sum(1 for p in positions if p.is_edited)
+    num_uncertain = sum(1 for p in positions if p.mechanism == ErrorMechanism.UNCERTAIN)
+    num_phono = sum(1 for p in positions if p.mechanism == ErrorMechanism.PHONOLOGICAL)
+    num_visual = sum(1 for p in positions if p.mechanism == ErrorMechanism.VISUAL)
+
+    features = torch.tensor([
+        max(detection_scores),                          # [0]
+        sum(detection_scores) / n,                      # [1]
+        max(uncertainties),                             # [2]
+        sum(uncertainties) / n,                         # [3]
+        min(margins),                                   # [4]
+        num_edited / n,                                 # [5]
+        num_uncertain / n,                              # [6]
+        num_phono / n,                                  # [7]
+        num_visual / n,                                 # [8]
+        min(n / 128.0, 1.0),                            # [9]
+    ], dtype=torch.float32)
+
+    return features
+
+
+class RouterMLP(nn.Module):
+    """
+    轻量级 MLP 二分类网络，输入特征向量，输出调用 LLM 的概率。
+
+    结构：10 → 32 → 16 → 1
+    参数量：约 900，极其轻量。
+    """
+
+    def __init__(self, input_dim: int = _FEATURE_DIM):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(16, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """返回调用 LLM 的概率 (sigmoid 后的标量)"""
+        return torch.sigmoid(self.net(x))
+
+
+class MLPRouter:
+    """
+    基于可学习 MLP 的自适应路由器。
+
+    使用训练好的 RouterMLP 网络替代人工阈值，
+    从 SentencePrediction 中提取特征，通过 MLP 预测是否需要 LLM 验证。
+
+    如果没有提供预训练权重，会降级为使用默认阈值 0.5 的启发式判断。
+
+    用法:
+        # 使用预训练权重
+        router = MLPRouter(checkpoint_path="./ckpt/router_mlp.pt")
+
+        # 未训练时（降级模式）
+        router = MLPRouter()
+    """
+
+    def __init__(
+            self,
+            checkpoint_path: Optional[str] = None,
+            threshold: float = 0.5,
+            device: str = "cpu",
+    ):
+        self.threshold = threshold
+        self.device = device
+        self.mlp = RouterMLP()
+
+        if checkpoint_path is not None:
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+            self.mlp.load_state_dict(state_dict)
+
+        self.mlp.to(device)
+        self.mlp.eval()
+
+    def decide(self, prediction: SentencePrediction) -> RouterDecision:
+        features = extract_features(prediction).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            prob = self.mlp(features).item()
+
+        invoke_llm = prob >= self.threshold
+
+        reasons = []
+        if invoke_llm:
+            reasons.append(f"mlp_router_high_risk(prob={prob:.3f})")
+        else:
+            reasons.append(f"mlp_router_low_risk(prob={prob:.3f})")
+
+        return RouterDecision(
+            invoke_llm=invoke_llm,
+            risk_score=prob,
+            reasons=reasons,
+        )
+
+
+# ──────────────────────────────────────────────────────────
+# 3. 向后兼容：保留 RiskAwareRouter 别名
+# ──────────────────────────────────────────────────────────
+
+# 默认使用启发式路由器，保持现有代码不被破坏
+RiskAwareRouter = HeuristicRouter
