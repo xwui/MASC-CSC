@@ -8,6 +8,7 @@ from masc_csc.llm_verifier import (
 )
 from masc_csc.mechanism import MechanismInferencer
 from masc_csc.pipeline import MASCCSCPipeline
+from masc_csc.selective_escalation import SelectiveEscalationRouter
 from masc_csc.router import (
     HeuristicRouter,
     MLPRouter,
@@ -43,6 +44,7 @@ __all__ = [
     "RiskAwareRouter",
     "RouterDecision",
     "RouterMLP",
+    "SelectiveEscalationRouter",
     "SentencePrediction",
     "TokenAlternative",
     "VerificationResult",

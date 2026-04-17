@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from masc_csc import MechanismInferencer, RiskAwareRouter  # noqa: E402
 from masc_csc.types import ErrorMechanism, PositionPrediction, SentencePrediction, TokenAlternative  # noqa: E402
+from masc_csc.frontend_adapter import HFNamBertFrontendAdapter  # noqa: E402
 from models.multimodal_frontend import MultimodalCSCFrontend  # noqa: E402
 from utils.metrics import SighanCSCMetrics  # noqa: E402
 
@@ -28,6 +29,12 @@ def build_model_args(device: str):
 
 
 def load_frontend_model(checkpoint_path: str, device: str):
+    path = Path(checkpoint_path)
+    if path.is_dir():
+        model = HFNamBertFrontendAdapter(str(path), device)
+        print(f"[*] 已加载本地 HuggingFace 前端目录: {path}")
+        return model
+
     args = build_model_args(device=device)
     model = MultimodalCSCFrontend(args)
     state = torch.load(checkpoint_path, map_location="cpu")
@@ -200,7 +207,7 @@ def build_router(args) -> RiskAwareRouter:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="只评估 frontend+router，不调用 LLM。")
-    parser.add_argument("--ckpt-path", type=str, required=True, help="BERT frontend checkpoint 路径。")
+    parser.add_argument("--ckpt-path", type=str, required=True, help="前端权重来源。支持本地 HuggingFace NamBert 模型目录，或 frontend checkpoint 文件。")
     parser.add_argument("--data-path", type=str, required=True, help="测试数据路径，支持 jsonl/csv/目录/逗号分隔。")
     parser.add_argument("--output-dir", type=str, required=True, help="评估结果输出目录。")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")

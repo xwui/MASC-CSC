@@ -66,18 +66,23 @@ class MASCCSCPipeline:
 
     def correct(self, sentence: str, top_k: int = 5) -> VerificationResult:
         prediction = self.analyze(sentence, top_k=top_k)
-        candidates = self.candidate_generator.generate(prediction)
         routing = self.router.decide(prediction)
 
         if routing.invoke_llm:
-            result = self.verifier.verify(prediction, candidates)
+            candidates = self.candidate_generator.generate(prediction)
+            result = self.verifier.verify(
+                prediction,
+                candidates,
+                selected_positions=routing.supplement_positions,
+            )
             result.reason = f"{result.reason}\n\nRouter: {routing.reasons}, risk={routing.risk_score:.2f}"
             return result
 
-        selected = max(candidates, key=lambda candidate: candidate.score)
         return VerificationResult(
-            text=selected.text,
-            selected_source=selected.source,
-            reason=f"Router skipped LLM verification: {routing.reasons}, risk={routing.risk_score:.2f}",
-            candidates=candidates,
+            text=prediction.predicted_text,
+            selected_source="front-end-top1",
+            reason=(
+                f"Router skipped LLM verification and preserved frontend top1: "
+                f"{routing.reasons}, risk={routing.risk_score:.2f}"
+            ),
         )

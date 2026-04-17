@@ -9,11 +9,11 @@ ROOT = FILE.parents[1]
 
 class CSCDataset(Dataset):
     """
-    通用 CSC 数据集加载器，支持从 CSV 文件加载 (src, tgt) 句对。
+    通用 CSC 数据集加载器，支持从 CSV 或 JSONL 文件加载 (src, tgt) 句对。
 
     参数：
         data_file (str): 数据文件名（相对于 datasets/ 目录的路径），
-                         例如 'wang271k_sighan_train.csv' 或 'cscd_ns_train.csv'。
+                         例如 'wang271k_sighan_train.csv' 或 'Sighan/sighan15_train.jsonl'。
         filepath (str or Path): 可选，如果指定则直接使用该路径加载，忽略 data_file 的默认路径推断。
         limit_size (int): 若大于 0，则截断数据集至该条数（用于快速调试）。
         allow_unequal_length (bool): 是否保留 src 和 tgt 长度不等的样本。
@@ -24,7 +24,7 @@ class CSCDataset(Dataset):
     def __init__(self, data_file: str, filepath=None, limit_size=-1,
                  allow_unequal_length: bool = False, **kwargs):
         super(CSCDataset, self).__init__()
-        self.data_name = data_file.replace(".csv", "")
+        self.data_name = data_file.replace(".csv", "").replace(".jsonl", "")
         self.allow_unequal_length = allow_unequal_length
 
         if filepath is not None:
@@ -32,7 +32,11 @@ class CSCDataset(Dataset):
         else:
             filepath = self.get_filepath(data_file)
 
-        self.data, self.error_data = self.load_data_from_csv(filepath)
+        filepath = str(filepath)
+        if filepath.endswith(".jsonl"):
+            self.data, self.error_data = self.load_data_from_jsonl(filepath)
+        else:
+            self.data, self.error_data = self.load_data_from_csv(filepath)
 
         if limit_size > 0:
             self.data = self.data[:limit_size]
@@ -43,6 +47,21 @@ class CSCDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
+
+    def _filter_pair(self, src, tgt, data, error_data):
+        """共用的 src/tgt 过滤逻辑"""
+        src = ''.join(src.replace(" ", "").replace(u"\u3000", ""))
+        tgt = ''.join(tgt.replace(" ", "").replace(u"\u3000", ""))
+
+        if not src or not tgt:
+            return
+
+        if len(src) == len(tgt):
+            data.append((src, tgt))
+        elif self.allow_unequal_length:
+            data.append((src, tgt))
+        else:
+            error_data.append((src, tgt))
 
     def load_data_from_csv(self, filepath):
         log.info("Load dataset from %s", filepath)
@@ -57,21 +76,31 @@ class CSCDataset(Dataset):
                 continue
             src = items[0].strip()
             tgt = items[1].strip()
+            self._filter_pair(src, tgt, data, error_data)
 
-            src = ''.join(src.replace(" ", "").replace(u"\u3000", ""))
-            tgt = ''.join(tgt.replace(" ", "").replace(u"\u3000", ""))
+        log.info(
+            "Load completed. Success num: %d, Skipped (unequal length) num: %d.",
+            len(data), len(error_data)
+        )
 
-            if not src or not tgt:
-                continue
+        return data, error_data
 
-            if len(src) == len(tgt):
-                data.append((src, tgt))
-            elif self.allow_unequal_length:
-                # CSCD-NS 等含词级错误的数据集，src/tgt 长度可能不等
-                # 此类样本作为正常数据保留，但不参与 character-level 对齐评估
-                data.append((src, tgt))
-            else:
-                error_data.append((src, tgt))
+    def load_data_from_jsonl(self, filepath):
+        import json
+        log.info("Load dataset from %s (JSONL)", filepath)
+
+        data = []
+        error_data = []
+        with open(filepath, mode='r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                src = obj.get("source", obj.get("src", "")).strip()
+                tgt = obj.get("target", obj.get("tgt", "")).strip()
+                if src and tgt:
+                    self._filter_pair(src, tgt, data, error_data)
 
         log.info(
             "Load completed. Success num: %d, Skipped (unequal length) num: %d.",

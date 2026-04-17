@@ -12,7 +12,8 @@ MASC-CSC Local LLM Verifier
 
 import logging
 import string
-from typing import Dict, List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
@@ -56,12 +57,9 @@ class ChineseCharLogitsProcessor(LogitsProcessor):
     """
     定点纠正模式的约束解码器。
 
-    按生成步骤交替约束：
-    - 奇数步（第1、3、5...个 token）：只允许汉字 token
-    - 偶数步（第2、4...个 token）：只允许逗号 token
-    - 最后一步：只允许汉字 token
-
-    这样 LLM 输出格式为："欢,苹" （汉字,汉字,汉字...）
+    输出格式被约束为：汉字,汉字,汉字...
+    - 第 1,3,5... 步：只允许单个汉字 token
+    - 第 2,4,6... 步：只允许逗号 token
     """
 
     def __init__(
@@ -79,16 +77,61 @@ class ChineseCharLogitsProcessor(LogitsProcessor):
         mask = torch.full_like(scores, float('-inf'))
 
         if self.step % 2 == 0:
-            # 汉字步
-            for tid in self.chinese_ids:
-                mask[:, tid] = 0.0
+            valid_ids = self.chinese_ids
         else:
-            # 逗号步
-            for tid in self.comma_ids:
-                mask[:, tid] = 0.0
+            valid_ids = self.comma_ids
+
+        for tid in valid_ids:
+            mask[:, tid] = 0.0
 
         self.step += 1
         return scores + mask
+
+
+class ChoiceSequenceLogitsProcessor(LogitsProcessor):
+    """
+    定点 closed-choice 模式的约束解码器。
+
+    输出格式被约束为：字母,字母,字母...
+    - 第 1,3,5... 步：只允许选项字母 token
+    - 第 2,4,6... 步：只允许逗号 token
+    """
+
+    def __init__(
+            self,
+            option_token_ids: List[int],
+            comma_token_ids: List[int],
+            total_positions: int,
+    ):
+        self.option_ids = set(option_token_ids)
+        self.comma_ids = set(comma_token_ids)
+        self.total_positions = total_positions
+        self.step = 0
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        mask = torch.full_like(scores, float('-inf'))
+        valid_ids = self.option_ids if self.step % 2 == 0 else self.comma_ids
+        for token_id in valid_ids:
+            mask[:, token_id] = 0.0
+        self.step += 1
+        return scores + mask
+
+
+@dataclass
+class StageOneDecision:
+    position: PositionPrediction
+    options: List[str]
+    label: str
+    selected_token: Optional[str]
+    abstained: bool
+
+
+@dataclass
+class StageTwoProposal:
+    position: PositionPrediction
+    proposed_char: Optional[str]
+    kept: bool
+    raw_output: str
 
 
 # ──────────────────────────────────────────────────────────
@@ -98,7 +141,13 @@ class ChineseCharLogitsProcessor(LogitsProcessor):
 class NoOpVerifier:
     """不调用 LLM，直接选择得分最高的候选"""
 
-    def verify(self, prediction: SentencePrediction, candidates: Sequence[CandidateSentence]) -> VerificationResult:
+    def verify(
+            self,
+            prediction: SentencePrediction,
+            candidates: Sequence[CandidateSentence],
+            selected_positions: Optional[List[int]] = None,
+    ) -> VerificationResult:
+        del prediction, selected_positions
         selected = max(candidates, key=lambda candidate: candidate.score)
         return VerificationResult(
             text=selected.text,
@@ -205,9 +254,9 @@ class BaichuanLocalVerifier:
                      len(self._chinese_token_ids), len(self._comma_token_ids))
 
     def _resolve_option_token_ids(self) -> List[int]:
-        """获取选项字母 A-E 对应的 token id"""
+        """获取选项字母 A-Z 对应的 token id"""
         option_ids = []
-        for letter in ['A', 'B', 'C', 'D', 'E']:
+        for letter in string.ascii_uppercase:
             ids = self.tokenizer.encode(letter, add_special_tokens=False)
             if ids:
                 option_ids.append(ids[0])
@@ -232,6 +281,52 @@ class BaichuanLocalVerifier:
             if ids:
                 comma_ids.append(ids[0])
         return comma_ids
+
+    def _prepare_prompt_inputs(self, prompt: str) -> Dict[str, torch.Tensor]:
+        if hasattr(self.tokenizer, 'apply_chat_template'):
+            messages = [
+                {
+                    'role': 'system',
+                    'content': '你是中文拼写纠错助手。严格按要求只输出最终答案，不要解释，不要复述题目。',
+                },
+                {
+                    'role': 'user',
+                    'content': prompt,
+                },
+            ]
+            rendered = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            model_inputs = self.tokenizer(rendered, return_tensors='pt')
+        else:
+            model_inputs = self.tokenizer(prompt, return_tensors='pt')
+        return {name: tensor.to(self.model.device) for name, tensor in model_inputs.items()}
+
+    def _generate_text(
+            self,
+            inputs: Dict[str, torch.Tensor],
+            max_new_tokens: int,
+            logits_processor: Optional[LogitsProcessorList] = None,
+    ):
+        generate_kwargs = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=0.001,
+            top_p=1.0,
+            top_k=50,
+            repetition_penalty=1.0,
+            pad_token_id=self.tokenizer.eos_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
+        if logits_processor is not None:
+            generate_kwargs['logits_processor'] = logits_processor
+
+        outputs = self.model.generate(**inputs, **generate_kwargs)
+        generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
+        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        return generated_ids, generated_text
 
     @staticmethod
     def _label(index: int) -> str:
@@ -301,8 +396,8 @@ class BaichuanLocalVerifier:
         """选择题模式的验证逻辑（旧版）"""
         prompt = self._build_choice_prompt(prediction, candidates)
 
-        inputs = self.tokenizer(prompt, return_tensors="pt")
-        input_ids = inputs["input_ids"].to(self.model.device)
+        inputs = self._prepare_prompt_inputs(prompt)
+        input_ids = inputs["input_ids"]
 
         num_candidates = len(candidates)
         valid_ids = self._option_token_ids[:num_candidates]
@@ -310,15 +405,11 @@ class BaichuanLocalVerifier:
             ConstrainedChoiceLogitsProcessor(valid_ids),
         ])
 
-        outputs = self.model.generate(
-            input_ids,
+        generated_ids, _ = self._generate_text(
+            inputs,
             max_new_tokens=self.max_new_tokens,
             logits_processor=logits_processor,
-            do_sample=False,
-            pad_token_id=self.tokenizer.eos_token_id,
         )
-
-        generated_ids = outputs[0][input_ids.shape[1]:]
         if len(generated_ids) == 0:
             logger.warning("LLM generated empty output, falling back.")
             choice_index = max(range(len(candidates)), key=lambda i: candidates[i].score)
@@ -339,52 +430,78 @@ class BaichuanLocalVerifier:
     # 定点纠正模式（新版 Prompt + 解码）
     # ──────────────────────────────────────────────────────
 
-    def _get_suspicious_positions(self, prediction: SentencePrediction) -> List[PositionPrediction]:
+    def _get_suspicious_positions(
+            self,
+            prediction: SentencePrediction,
+            selected_positions: Optional[List[int]] = None,
+    ) -> List[PositionPrediction]:
         """
-        获取需要 LLM 定点纠正的可疑位置。
-        选取被编辑过或检测分较高的位置，按风险排序，最多取 3 个。
+        Resolve the positions for targeted correction.
+
+        If the router provides explicit positions, prefer them. Otherwise fall back
+        to the verifier's own high-recall proposal heuristic.
         """
+        if selected_positions:
+            selected = []
+            seen = set()
+            for index in selected_positions:
+                if index in seen:
+                    continue
+                if 0 <= index < len(prediction.positions):
+                    selected.append(prediction.positions[index])
+                    seen.add(index)
+            if selected:
+                return selected
+
         candidates_pos = []
         for pos in prediction.positions:
             if pos.is_edited or pos.detection_score >= 0.08 or pos.uncertainty >= 0.80:
                 candidates_pos.append(pos)
 
-        # 按检测分 + 不确定度降序排列
         candidates_pos.sort(
             key=lambda p: (p.detection_score + p.uncertainty * 0.5),
             reverse=True,
         )
         return candidates_pos[:3]
 
+    def _build_targeted_options(
+            self,
+            position: PositionPrediction,
+            max_options: int = 4,
+    ) -> List[str]:
+        options: List[str] = []
+        seen = set()
+
+        def add(token: str):
+            if not self._is_single_chinese_char(token):
+                return
+            if token in seen:
+                return
+            seen.add(token)
+            options.append(token)
+
+        add(position.source_token)
+        if position.predicted_token != position.source_token:
+            add(position.predicted_token)
+        for alternative in position.alternatives:
+            add(alternative.token)
+            if len(options) >= max_options:
+                break
+
+        return options or [position.source_token]
+
     def _build_targeted_prompt(
             self,
             prediction: SentencePrediction,
             suspicious_positions: List[PositionPrediction],
+            option_lists: Optional[List[List[str]]] = None,
+            allow_abstain: bool = False,
+            stage_name: str = "第一阶段",
     ) -> str:
-        """
-        构建定点纠正模式的 Prompt。
-
-        示例输出：
-        ────────────────────
-        以下句子中标记的位置可能存在拼写错误。
-        请根据上下文语义，判断每个标记位置的正确汉字。
-
-        句子：我 喜 [换] 吃 [平] 果
-
-        可疑位置：
-        [1] 第3字"换" — 音近错误（读音相似），前端建议"欢"
-        [2] 第5字"平" — 形近错误（字形相似），前端建议"苹"
-
-        请按顺序输出每个可疑位置的正确汉字，用逗号分隔。
-        如果前端建议正确就采纳，如果不正确请给出你认为正确的字，如果原字无误请保留原字。
-
-        输出：
-        ────────────────────
-        """
+        """Build a targeted closed-choice prompt with optional abstention."""
         source_text = prediction.source_text
         source_chars = list(source_text)
 
-        # 构建带标记的句子展示
         suspicious_indices = set(p.index for p in suspicious_positions)
         display_chars = []
         for i, char in enumerate(source_chars):
@@ -394,146 +511,491 @@ class BaichuanLocalVerifier:
                 display_chars.append(char)
         display_sentence = " ".join(display_chars)
 
-        # 构建可疑位置详情
-        position_lines = []
+        position_blocks = []
         for rank, pos in enumerate(suspicious_positions, 1):
             idx = pos.index
             char = source_chars[idx] if idx < len(source_chars) else "?"
             mech_label = MECHANISM_LABEL_ZH.get(pos.mechanism, "不确定")
             suggestion = pos.predicted_token
-            position_lines.append(
-                f"[{rank}] 第{idx + 1}字\"{char}\" — {mech_label}，前端建议\"{suggestion}\""
+            options = option_lists[rank - 1] if option_lists is not None else self._build_targeted_options(pos)
+            option_lines = []
+            for option_index, token in enumerate(options):
+                label = self._label(option_index)
+                if option_index == 0:
+                    option_lines.append(f"    {label}. 保持原字：{token}")
+                else:
+                    option_lines.append(f"    {label}. 改为：{token}")
+            if allow_abstain:
+                option_lines.append("    N. 候选均不合适")
+            position_blocks.append(
+                f"[{rank}] 第{idx + 1}字\"{char}\" — {mech_label}，前端建议\"{suggestion}\"\n"
+                f"{chr(10).join(option_lines)}"
             )
 
+        abstain_instructions = (
+            "如果所有候选都明显不合适，并且该位置确实存在拼写错误，才输出 N。\n"
+            "N 不是默认答案，只有在候选空间不足时才能使用。\n"
+            if allow_abstain else
+            "你必须在给定候选中做出选择，不能输出候选外答案。\n"
+        )
         prompt = (
-            f"以下句子中标记的位置可能存在拼写错误。\n"
-            f"请根据上下文语义，判断每个标记位置的正确汉字。\n\n"
+            f"{stage_name}：以下句子中只有标记位置可能存在拼写错误。\n"
+            "你是中文拼写纠错验证器，不是改写器。\n"
+            "禁止同义替换、风格润色、专名改写、代词性别替换、异体字/规范字替换。\n"
+            "除标记位置外，不要改动任何其他字符。\n\n"
             f"句子：{display_sentence}\n\n"
-            f"可疑位置：\n"
-            f"{chr(10).join(position_lines)}\n\n"
-            f"请按顺序输出每个可疑位置的正确汉字，用逗号分隔。\n"
-            f"如果前端建议正确就采纳，如果不正确请给出你认为正确的字，如果原字无误请保留原字。\n\n"
-            f"输出："
+            "可疑位置与选项：\n"
+            f"{chr(10).join(position_blocks)}\n\n"
+            f"{abstain_instructions}"
+            "请按顺序输出每个可疑位置的选项字母，用逗号分隔。\n"
+            "严格只输出字母和逗号，不要解释，不要输出序号、空格或其他任何文字。\n"
+            "输出示例：A,B,C\n\n"
+            "输出："
         )
         return prompt
 
-    def _parse_targeted_output(
+    def _build_stage2_prompt(
+            self,
+            prediction: SentencePrediction,
+            position: PositionPrediction,
+            rejected_options: List[str],
+    ) -> str:
+        source_chars = list(prediction.source_text)
+        display_chars = []
+        for i, char in enumerate(source_chars):
+            display_chars.append(f"[{char}]" if i == position.index else char)
+        display_sentence = " ".join(display_chars)
+        options_text = " / ".join(rejected_options)
+        return (
+            "第二阶段：前一步已经判定当前候选都不合适。\n"
+            "你是中文拼写纠错补充器，不是改写器。\n"
+            "只允许针对指定位置输出一个单个汉字；如果没有明确更优的补充修正，请直接输出原字本身。\n"
+            "禁止同义替换、风格润色、专名改写、代词性别替换、异体字/规范字替换。\n\n"
+            f"句子：{display_sentence}\n"
+            f"检查位置：第{position.index + 1}字“{position.source_token}”\n"
+            f"已判定不合适的候选：{options_text}\n\n"
+            "要求：\n"
+            "1. 只能输出一个汉字\n"
+            "2. 如果没有把握，请输出原字本身\n"
+            "3. 不要输出解释、标点或其他内容\n\n"
+            "输出："
+        )
+
+    @staticmethod
+    def _first_chinese_char(text: str) -> Optional[str]:
+        for ch in text:
+            if '\u4e00' <= ch <= '\u9fff':
+                return ch
+        return None
+
+    @staticmethod
+    def _contains_keep_marker(text: str) -> bool:
+        normalized = text.strip().upper()
+        keep_markers = ["KEEP", "保留", "原字", "不改", "保持"]
+        return any(marker in normalized or marker in text for marker in keep_markers)
+
+    @staticmethod
+    def _is_single_chinese_char(text: str) -> bool:
+        return len(text) == 1 and '\u4e00' <= text <= '\u9fff'
+
+    def _parse_choice_sequence_labels(
             self,
             generated_text: str,
-            suspicious_positions: List[PositionPrediction],
-    ) -> List[str]:
-        """
-        解析定点纠正模式的 LLM 输出。
+            expected_count: int,
+    ) -> List[Optional[str]]:
+        """Parse comma-separated choice labels."""
+        text = generated_text.replace("，", ",").replace(" ", "").strip().upper()
+        segments = [seg.strip() for seg in text.split(",") if seg.strip()]
+        labels: List[Optional[str]] = []
+        seg_idx = 0
+        for _ in range(expected_count):
+            chosen_label = None
+            while seg_idx < len(segments):
+                segment = segments[seg_idx]
+                seg_idx += 1
+                label = next((ch for ch in segment if ch in string.ascii_uppercase), None)
+                if label is not None:
+                    chosen_label = label
+                    break
+            labels.append(chosen_label)
+        return labels
 
-        输入：如 "欢,苹" 或 "欢，苹"
-        输出：["欢", "苹"]
-
-        如果解析失败，降级使用前端建议。
-        """
-        # 统一逗号格式
-        text = generated_text.replace("，", ",").strip()
-        chars = [c.strip() for c in text.split(",") if c.strip()]
-
-        # 补齐或截断到目标位置数
-        n = len(suspicious_positions)
-        result = []
-        for i in range(n):
-            if i < len(chars) and len(chars[i]) == 1 and '\u4e00' <= chars[i] <= '\u9fff':
-                result.append(chars[i])
-            else:
-                # 降级：使用前端建议
-                result.append(suspicious_positions[i].predicted_token)
-                logger.warning(
-                    "Position %d: failed to parse LLM output, using frontend suggestion '%s'.",
-                    i, suspicious_positions[i].predicted_token,
+    def _run_stage1(
+            self,
+            prediction: SentencePrediction,
+            active_positions: List[PositionPrediction],
+            option_lists: List[List[str]],
+    ) -> List[StageOneDecision]:
+        prompt = self._build_targeted_prompt(
+            prediction,
+            active_positions,
+            option_lists,
+            allow_abstain=True,
+            stage_name="第一阶段",
+        )
+        inputs = self._prepare_prompt_inputs(prompt)
+        n_positions = len(active_positions)
+        logits_processor = None
+        if self._option_token_ids and (n_positions == 1 or self._comma_token_ids):
+            logits_processor = LogitsProcessorList([
+                ChoiceSequenceLogitsProcessor(
+                    self._option_token_ids,
+                    self._comma_token_ids,
+                    n_positions,
                 )
-        return result
+            ])
+
+        max_tokens = max(1, 2 * n_positions - 1)
+        _, generated_text = self._generate_text(
+            inputs,
+            max_new_tokens=max_tokens,
+            logits_processor=logits_processor,
+        )
+        logger.info("Stage-1 closed-choice output: %s", generated_text)
+
+        labels = self._parse_choice_sequence_labels(generated_text, n_positions)
+        decisions: List[StageOneDecision] = []
+        for pos, options, label in zip(active_positions, option_lists, labels):
+            if label == "N":
+                decisions.append(
+                    StageOneDecision(
+                        position=pos,
+                        options=options,
+                        label="N",
+                        selected_token=None,
+                        abstained=True,
+                    )
+                )
+                continue
+
+            selected_token = None
+            if label is not None:
+                option_index = string.ascii_uppercase.index(label)
+                if option_index < len(options):
+                    selected_token = options[option_index]
+
+            if selected_token is None:
+                selected_token = options[0] if options else pos.source_token
+                logger.warning(
+                    "Failed to parse stage-1 output '%s' for position %d, using fallback '%s'.",
+                    generated_text,
+                    pos.index,
+                    selected_token,
+                )
+                label = "A"
+
+            decisions.append(
+                StageOneDecision(
+                    position=pos,
+                    options=options,
+                    label=label,
+                    selected_token=selected_token,
+                    abstained=False,
+                )
+            )
+        return decisions
+
+    def _should_allow_open_repair(self, position: PositionPrediction) -> bool:
+        if position.detection_score >= 0.25:
+            return True
+        if position.uncertainty >= 1.10:
+            return True
+        if position.margin <= 0.12:
+            return True
+        if position.mechanism == ErrorMechanism.UNCERTAIN:
+            return True
+        return position.is_edited
+
+    def _parse_stage2_output(self, generated_text: str, source_char: str) -> str:
+        proposed_char = self._first_chinese_char(generated_text)
+        if proposed_char is not None:
+            return proposed_char
+        if self._contains_keep_marker(generated_text):
+            return source_char
+        return source_char
+
+    def _run_stage2(
+            self,
+            prediction: SentencePrediction,
+            stage1_decisions: List[StageOneDecision],
+    ) -> List[StageTwoProposal]:
+        proposals: List[StageTwoProposal] = []
+        for decision in stage1_decisions:
+            if not decision.abstained:
+                continue
+            if not self._should_allow_open_repair(decision.position):
+                proposals.append(
+                    StageTwoProposal(
+                        position=decision.position,
+                        proposed_char=decision.position.source_token,
+                        kept=True,
+                        raw_output="",
+                    )
+                )
+                continue
+
+            prompt = self._build_stage2_prompt(
+                prediction,
+                decision.position,
+                decision.options,
+            )
+            inputs = self._prepare_prompt_inputs(prompt)
+            logits_processor = None
+            if self._chinese_token_ids:
+                logits_processor = LogitsProcessorList([
+                    ChineseCharLogitsProcessor(
+                        self._chinese_token_ids,
+                        self._comma_token_ids,
+                        1,
+                    )
+                ])
+
+            _, generated_text = self._generate_text(
+                inputs,
+                max_new_tokens=1,
+                logits_processor=logits_processor,
+            )
+            logger.info(
+                "Stage-2 restricted repair output for position %d: %s",
+                decision.position.index,
+                generated_text,
+            )
+            proposed_char = self._parse_stage2_output(generated_text, decision.position.source_token)
+            proposals.append(
+                StageTwoProposal(
+                    position=decision.position,
+                    proposed_char=proposed_char,
+                    kept=(proposed_char == decision.position.source_token),
+                    raw_output=generated_text,
+                )
+            )
+        return proposals
+
+    def _run_stage3(
+            self,
+            prediction: SentencePrediction,
+            stage1_decisions: List[StageOneDecision],
+            proposals: List[StageTwoProposal],
+    ) -> Dict[int, Tuple[str, str]]:
+        proposal_map = {proposal.position.index: proposal for proposal in proposals}
+        active_positions: List[PositionPrediction] = []
+        option_lists: List[List[str]] = []
+        fallback_tokens: Dict[int, str] = {}
+
+        for decision in stage1_decisions:
+            proposal = proposal_map.get(decision.position.index)
+            if proposal is None or proposal.kept or proposal.proposed_char is None:
+                continue
+            if proposal.proposed_char == decision.position.source_token:
+                continue
+
+            options = list(decision.options)
+            if proposal.proposed_char not in options:
+                options.append(proposal.proposed_char)
+
+            if len(options) <= 1:
+                continue
+
+            active_positions.append(decision.position)
+            option_lists.append(options)
+            fallback_tokens[decision.position.index] = decision.position.source_token
+
+        if not active_positions:
+            return {}
+
+        prompt = self._build_targeted_prompt(
+            prediction,
+            active_positions,
+            option_lists,
+            allow_abstain=False,
+            stage_name="第三阶段",
+        )
+        inputs = self._prepare_prompt_inputs(prompt)
+        n_positions = len(active_positions)
+        logits_processor = None
+        if self._option_token_ids and (n_positions == 1 or self._comma_token_ids):
+            logits_processor = LogitsProcessorList([
+                ChoiceSequenceLogitsProcessor(
+                    self._option_token_ids,
+                    self._comma_token_ids,
+                    n_positions,
+                )
+            ])
+
+        max_tokens = max(1, 2 * n_positions - 1)
+        _, generated_text = self._generate_text(
+            inputs,
+            max_new_tokens=max_tokens,
+            logits_processor=logits_processor,
+        )
+        logger.info("Stage-3 recheck output: %s", generated_text)
+
+        labels = self._parse_choice_sequence_labels(generated_text, n_positions)
+        final_choices: Dict[int, Tuple[str, str]] = {}
+        for pos, options, label in zip(active_positions, option_lists, labels):
+            selected_token = None
+            if label is not None:
+                option_index = string.ascii_uppercase.index(label)
+                if option_index < len(options):
+                    selected_token = options[option_index]
+            if selected_token is None:
+                selected_token = fallback_tokens.get(pos.index, pos.source_token)
+                final_choices[pos.index] = (selected_token, "stage3_fallback")
+            elif selected_token == fallback_tokens.get(pos.index, pos.source_token):
+                final_choices[pos.index] = (selected_token, "stage3_reject_open")
+            else:
+                final_choices[pos.index] = (selected_token, "accepted_stage3_recheck")
+        return final_choices
+
+    def _safe_merge_targeted_corrections(
+            self,
+            prediction: SentencePrediction,
+            candidates: Sequence[CandidateSentence],
+            suspicious_positions: List[PositionPrediction],
+            corrections: List[str],
+            decision_reasons: Optional[Dict[int, str]] = None,
+    ) -> VerificationResult:
+        result_chars = list(prediction.source_text)
+        corrected_indices = []
+        correction_details = []
+
+        for pos, correction in zip(suspicious_positions, corrections):
+            src_char = prediction.source_text[pos.index]
+            accepted_char = src_char
+            decision_reason = (decision_reasons or {}).get(pos.index, 'keep')
+
+            if correction == 'KEEP':
+                accepted_char = src_char
+                decision_reason = 'llm_keep'
+            elif not self._is_single_chinese_char(correction):
+                accepted_char = src_char
+                decision_reason = 'invalid_output_fallback'
+            elif correction == src_char:
+                accepted_char = src_char
+                if decision_reason == 'keep':
+                    decision_reason = 'llm_keep'
+            else:
+                high_confidence_frontend_keep = (
+                    (not pos.is_edited)
+                    and pos.detection_score < 0.10
+                    and pos.uncertainty < 0.90
+                    and pos.margin >= 0.35
+                )
+                if high_confidence_frontend_keep:
+                    accepted_char = src_char
+                    decision_reason = 'frontend_veto'
+                else:
+                    accepted_char = correction
+                    decision_reason = 'accepted_closed_choice'
+
+            result_chars[pos.index] = accepted_char
+            if accepted_char != src_char:
+                corrected_indices.append(pos.index)
+                correction_details.append(
+                    f"位置{pos.index + 1}: '{src_char}'→'{accepted_char}' ({decision_reason})"
+                )
+            else:
+                correction_details.append(
+                    f"位置{pos.index + 1}: '{src_char}'保持不变 ({decision_reason})"
+                )
+
+        corrected_text = "".join(result_chars)
+        reason = (
+            f"LLM verifier (targeted mode) processed {len(suspicious_positions)} positions and "
+            f"accepted {len(corrected_indices)} edits. "
+            f"Details: {'; '.join(correction_details)}"
+        )
+
+        return VerificationResult(
+            text=corrected_text,
+            selected_source='llm-targeted-correction',
+            reason=reason,
+            candidates=list(candidates),
+        )
 
     @torch.no_grad()
     def _verify_targeted(
             self,
             prediction: SentencePrediction,
             candidates: Sequence[CandidateSentence],
+            selected_positions: Optional[List[int]] = None,
     ) -> VerificationResult:
-        """
-        定点纠正模式的验证逻辑（新版）。
-
-        LLM 对每个可疑位置独立给出纠正字，不受 BERT 候选限制。
-        """
-        suspicious_positions = self._get_suspicious_positions(prediction)
+        """Hierarchical targeted verifier: stage1 choice+N, stage2 open repair, stage3 recheck."""
+        suspicious_positions = self._get_suspicious_positions(
+            prediction,
+            selected_positions=selected_positions,
+        )
 
         if not suspicious_positions:
-            # 没有可疑位置，直接返回原句
             return VerificationResult(
-                text=prediction.source_text,
-                selected_source="original",
-                reason="No suspicious positions for targeted correction.",
+                text=prediction.predicted_text,
+                selected_source='front-end-top1',
+                reason='No suspicious positions for targeted correction.',
                 candidates=list(candidates),
             )
 
-        prompt = self._build_targeted_prompt(prediction, suspicious_positions)
-        n_positions = len(suspicious_positions)
+        llm_positions = [
+            pos for pos in suspicious_positions
+            if self._is_single_chinese_char(prediction.source_text[pos.index])
+        ]
+        correction_map = {}
+        decision_reasons: Dict[int, str] = {}
+        for pos in suspicious_positions:
+            if pos not in llm_positions:
+                correction_map[pos.index] = pos.predicted_token if pos.is_edited else pos.source_token
+                decision_reasons[pos.index] = 'non_chinese_passthrough'
 
-        # Tokenize
-        inputs = self.tokenizer(prompt, return_tensors="pt")
-        input_ids = inputs["input_ids"].to(self.model.device)
-
-        # 构建约束解码器
-        logits_processor = LogitsProcessorList([
-            ChineseCharLogitsProcessor(
-                chinese_token_ids=self._chinese_token_ids,
-                comma_token_ids=self._comma_token_ids,
-                total_positions=n_positions,
-            ),
-        ])
-
-        # 生成：N 个汉字 + (N-1) 个逗号 = 2N-1 个 token
-        max_tokens = 2 * n_positions - 1
-        outputs = self.model.generate(
-            input_ids,
-            max_new_tokens=max(max_tokens, 1),
-            logits_processor=logits_processor,
-            do_sample=False,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
-
-        # 提取并解析生成的 token
-        generated_ids = outputs[0][input_ids.shape[1]:]
-        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        logger.info("Targeted correction LLM output: '%s'", generated_text)
-
-        corrections = self._parse_targeted_output(generated_text, suspicious_positions)
-
-        # 将纠正字回填到原句
-        result_chars = list(prediction.source_text)
-        corrected_indices = []
-        for pos, correction in zip(suspicious_positions, corrections):
-            if correction != result_chars[pos.index]:
-                corrected_indices.append(pos.index)
-            result_chars[pos.index] = correction
-
-        corrected_text = "".join(result_chars)
-
-        # 构造原因说明
-        correction_details = []
-        for pos, correction in zip(suspicious_positions, corrections):
-            src_char = prediction.source_text[pos.index]
-            if correction != src_char:
-                correction_details.append(f"位置{pos.index + 1}: '{src_char}'→'{correction}'")
+        active_positions = []
+        active_options = []
+        for pos in llm_positions:
+            options = self._build_targeted_options(pos)
+            if len(options) <= 1:
+                correction_map[pos.index] = options[0] if options else pos.source_token
+                decision_reasons[pos.index] = 'single_option_passthrough'
             else:
-                correction_details.append(f"位置{pos.index + 1}: '{src_char}'保持不变")
+                active_positions.append(pos)
+                active_options.append(options)
 
-        reason = (
-            f"LLM verifier (targeted mode) corrected {len(corrected_indices)} positions. "
-            f"Details: {'; '.join(correction_details)}"
-        )
+        if active_positions:
+            stage1_decisions = self._run_stage1(prediction, active_positions, active_options)
+            for decision in stage1_decisions:
+                if decision.abstained:
+                    correction_map[decision.position.index] = decision.position.source_token
+                    decision_reasons[decision.position.index] = 'stage1_abstain_keep'
+                else:
+                    correction_map[decision.position.index] = decision.selected_token or decision.position.source_token
+                    decision_reasons[decision.position.index] = 'accepted_stage1_choice'
 
-        return VerificationResult(
-            text=corrected_text,
-            selected_source="llm-targeted-correction",
-            reason=reason,
-            candidates=list(candidates),
+            stage2_proposals = self._run_stage2(prediction, stage1_decisions)
+            for proposal in stage2_proposals:
+                if proposal.kept:
+                    correction_map[proposal.position.index] = proposal.position.source_token
+                    decision_reasons[proposal.position.index] = 'stage2_keep_source'
+
+            stage3_results = self._run_stage3(prediction, stage1_decisions, stage2_proposals)
+            for index, (final_token, reason) in stage3_results.items():
+                correction_map[index] = final_token
+                decision_reasons[index] = reason
+
+        corrections = [
+            correction_map.get(pos.index, pos.predicted_token if pos.is_edited else pos.source_token)
+            for pos in suspicious_positions
+        ]
+        result = self._safe_merge_targeted_corrections(
+            prediction,
+            candidates,
+            suspicious_positions,
+            corrections,
+            decision_reasons=decision_reasons,
         )
+        stage1_abstain = sum(1 for reason in decision_reasons.values() if reason == 'stage1_abstain_keep')
+        stage2_proposed = sum(1 for reason in decision_reasons.values() if reason == 'accepted_stage3_recheck')
+        result.reason = (
+            f"Hierarchical verifier: stage1_abstain={stage1_abstain}, "
+            f"stage3_accepted={stage2_proposed}. {result.reason}"
+        )
+        result.selected_source = 'llm-targeted-hierarchical'
+        return result
 
     # ──────────────────────────────────────────────────────
     # 统一入口
@@ -543,6 +1005,7 @@ class BaichuanLocalVerifier:
             self,
             prediction: SentencePrediction,
             candidates: Sequence[CandidateSentence],
+            selected_positions: Optional[List[int]] = None,
     ) -> VerificationResult:
         """
         统一验证入口，根据 self.mode 调度到对应模式。
@@ -550,14 +1013,23 @@ class BaichuanLocalVerifier:
         if self.mode == "choice":
             return self._verify_choice(prediction, candidates)
         else:
-            return self._verify_targeted(prediction, candidates)
+            return self._verify_targeted(
+                prediction,
+                candidates,
+                selected_positions=selected_positions,
+            )
 
     # 向后兼容：保留 build_prompt 方法
     def build_prompt(self, prediction, candidates):
         if self.mode == "choice":
             return self._build_choice_prompt(prediction, candidates)
         suspicious = self._get_suspicious_positions(prediction)
-        return self._build_targeted_prompt(prediction, suspicious)
+        return self._build_targeted_prompt(
+            prediction,
+            suspicious,
+            allow_abstain=True,
+            stage_name="第一阶段",
+        )
 
 
 # ──────────────────────────────────────────────────────────

@@ -62,11 +62,12 @@ class MechanismAwareCandidateGenerator:
 
     def generate(self, prediction: SentencePrediction) -> List[CandidateSentence]:
         source_tokens = list(prediction.source_text)
+        max_det = max([p.detection_score for p in prediction.positions] + [0.0])
         candidates = {
             prediction.source_text: CandidateSentence(
                 text=prediction.source_text,
                 edited_indices=[],
-                score=1.0,
+                score=1.0 - max_det,
                 source="original",
             )
         }
@@ -134,9 +135,10 @@ class MechanismAwareCandidateGenerator:
             source="front-end-top1",
         )
 
+        # 解决 Bug：不要强制优先原句（len == 0），否则纯按前端预测时永远只会输出原句
         ranked_candidates = sorted(
             candidates.values(),
-            key=lambda candidate: (len(candidate.edited_indices) == 0, candidate.score),
+            key=lambda candidate: candidate.score,
             reverse=True,
         )
         return ranked_candidates[:self.max_candidates]

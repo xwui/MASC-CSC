@@ -156,7 +156,10 @@ def parse_args():
         "--max_error_to_clean_ratio",
         type=float,
         default=1.0,
-        help="只对 correction 样本生效；限制 error:clean 的最大比例，传负数关闭下采样",
+        help=(
+            "对 source/target 纠错样本表示 error:clean 最大比例；"
+            "对 targeted-choice 样本表示 edit:all-keep 最大比例；传负数关闭下采样"
+        ),
     )
     parser.add_argument("--max_seq_length", type=int, default=384, help="输入序列的最大长度")
     parser.add_argument("--logging_steps", type=int, default=5, help="多少步记录一次日志")
@@ -287,6 +290,52 @@ def format_chat_example(tokenizer, user_content: str, assistant_content: str, sy
     return f"User:\n{prompt}\n\nAssistant:{assistant_content}{eos}"
 
 
+def _infer_instruction_sample_label(example) -> int:
+    if "sample_label" in example:
+        try:
+            return int(example.get("sample_label", -1))
+        except Exception:
+            return -1
+
+    if "all_keep" in example:
+        return 0 if bool(example.get("all_keep")) else 1
+
+    if "num_non_keep" in example:
+        try:
+            return 0 if int(example.get("num_non_keep", 0)) == 0 else 1
+        except Exception:
+            return -1
+
+    task_type = str(example.get("task_type", "")).strip().lower()
+    if task_type == "targeted_choice":
+        output = str(example.get("output", "")).replace("，", ",").strip()
+        if not output:
+            return -1
+        labels = [item.strip().upper() for item in output.split(",") if item.strip()]
+        if not labels:
+            return -1
+        return 0 if all(label == "A" for label in labels) else 1
+    if task_type == "targeted_choice_abstain":
+        output = str(example.get("output", "")).replace("，", ",").strip()
+        if not output:
+            return -1
+        labels = [item.strip().upper() for item in output.split(",") if item.strip()]
+        if not labels:
+            return -1
+        return 0 if all(label == "A" for label in labels) else 1
+    if task_type == "targeted_open_repair":
+        output = str(example.get("output", "")).strip()
+        source_char = str(example.get("source_char", "")).strip()
+        if not output or not source_char:
+            return -1
+        return 0 if output == source_char else 1
+    if task_type == "targeted_recheck":
+        output = str(example.get("output", "")).strip().upper()
+        return 0 if output == "A" else 1
+
+    return -1
+
+
 def build_text(example, tokenizer):
     text = example.get("text")
     if text is not None:
@@ -302,7 +351,7 @@ def build_text(example, tokenizer):
         if input_text is not None and str(input_text).strip():
             prompt = f"{prompt}\n\n{str(input_text).strip()}"
         text = format_chat_example(tokenizer, user_content=prompt, assistant_content=str(output).strip())
-        return {"text": text, "_sample_label": -1}
+        return {"text": text, "_sample_label": _infer_instruction_sample_label(example)}
 
     source = example.get("source")
     target = example.get("target")

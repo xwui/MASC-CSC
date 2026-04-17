@@ -375,9 +375,11 @@ class EvalInTrainMetricsCallback(Callback):
         if not args.eval:
             return
 
-        test_data = "sighan_2015_test.csv"
-        if self.args.test_data:
+        test_data = "Sighan/sighan15_test.jsonl"
+        if getattr(self.args, 'test_data', None):
             test_data = self.args.test_data
+        elif getattr(self.args, 'val_data', None):
+            test_data = self.args.val_data
 
         test_datas = test_data.replace(" ", "").split(",")
         self.datasets = []

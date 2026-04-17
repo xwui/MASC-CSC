@@ -3,7 +3,7 @@
 # train_llm_lora.sh
 # 验证器大模型 (LLM Verifier) LoRA 参数高效微调脚本
 # 推荐基座：Qwen2.5-7B-Instruct
-# 默认训练数据：datasets/cscd-ns/train.jsonl
+# 推荐训练数据：先用 scripts/generate_llm_training_data.py 生成 targeted closed-choice JSONL
 # ===============================================================================
 
 set -euo pipefail
@@ -20,10 +20,10 @@ else
 fi
 TORCHRUN_PYTHON="${TORCHRUN_PYTHON:-${PYTHON_BIN}}"
 
-MIN_FREE_GB="${MIN_FREE_GB:-4}"
+MIN_FREE_GB="${MIN_FREE_GB:-18}"
 MODEL_PATH="${MODEL_PATH:-./LLM/Qwen2.5-7B-Instruct}"
-DATA_PATH="${DATA_PATH:-./datasets/cscd-ns/train.jsonl,./datasets/Sighan,./datasets/Lemon,./datasets/Wang271k}"
-OUTPUT_DIR="${OUTPUT_DIR:-./ckpt/llm_lora_qwen25_7b}"
+DATA_PATH="${DATA_PATH:-./data/llm_targeted_choice_train.jsonl}"
+OUTPUT_DIR="${OUTPUT_DIR:-./ckpt/llm_lora_qwen25_7b_targeted_choice}"
 NV_CUSPARSE="/home/bkai/anaconda3/envs/cwq_masc_csc/lib/python3.10/site-packages/nvidia/cusparse/lib"
 NV_CUDART="/home/bkai/anaconda3/envs/cwq_masc_csc/lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
 export LD_LIBRARY_PATH="/home/bkai/anaconda3/envs/cwq_masc_csc/lib/:${NV_CUSPARSE}:${NV_CUDART}:${LD_LIBRARY_PATH:-}"
@@ -143,14 +143,65 @@ validate_runtime
 echo "✅ 依赖、模型文件和训练数据预检通过。"
 echo "👉 模型位置: ${MODEL_PATH}"
 echo "👉 数据路径: ${DATA_PATH}"
-NUM_GPUS="${NUM_GPUS:-4}"
-MASTER_PORT="${MASTER_PORT:-29500}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+REQUESTED_NUM_GPUS="${NUM_GPUS:-4}"
+AUTO_SELECT_GPUS="${AUTO_SELECT_GPUS:-1}"
+if [ -n "${MASTER_PORT:-}" ]; then
+    MASTER_PORT="${MASTER_PORT}"
+else
+    MASTER_PORT="$(${PYTHON_BIN} - <<'PY' 
+import socket
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.bind(("", 0))
+    print(s.getsockname()[1])
+PY
+)"
+fi
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    SELECTED_CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}"
+elif [ "${AUTO_SELECT_GPUS}" = "1" ]; then
+    SELECTED_CUDA_VISIBLE_DEVICES="$(${PYTHON_BIN} - <<'PY' 
+import os
+import subprocess
+
+requested = int(os.environ.get("REQUESTED_NUM_GPUS", "4"))
+min_free_gb = float(os.environ.get("MIN_FREE_GB", "4"))
+min_free_mb = int(min_free_gb * 1024)
+cmd = [
+    "nvidia-smi",
+    "--query-gpu=index,memory.total,memory.used,memory.free",
+    "--format=csv,noheader,nounits",
+]
+try:
+    output = subprocess.check_output(cmd, text=True)
+except Exception as exc:
+    raise SystemExit(f"无法执行 nvidia-smi 自动选卡：{exc}")
+rows = []
+for line in output.splitlines():
+    if not line.strip():
+        continue
+    idx, total, used, free = [part.strip() for part in line.split(",")]
+    rows.append({"idx": int(idx), "total": int(total), "used": int(used), "free": int(free)})
+eligible = [row for row in rows if row["free"] >= min_free_mb]
+eligible.sort(key=lambda row: (-row["free"], row["idx"]))
+if len(eligible) < requested:
+    details = "; ".join(f"gpu{row['idx']}:free={row['free']}MB,used={row['used']}MB" for row in rows)
+    raise SystemExit(f"可用 GPU 不足：需要 {requested} 张且每张至少 {min_free_mb}MB 空闲；当前 {details}")
+selected = eligible[:requested]
+print(",".join(str(row["idx"]) for row in selected))
+PY
+)"
+else
+    SELECTED_CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
+fi
+CUDA_VISIBLE_DEVICES="${SELECTED_CUDA_VISIBLE_DEVICES}"
+NUM_GPUS="${REQUESTED_NUM_GPUS}"
+echo "👉 分布式端口: ${MASTER_PORT}"
+echo "👉 使用 GPU: ${CUDA_VISIBLE_DEVICES}"
 RUN_MODE="${RUN_MODE:-train}"   # train / preflight
 
 PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
 GRAD_ACC_STEPS="${GRAD_ACC_STEPS:-32}"
-LEARNING_RATE="${LEARNING_RATE:-5e-5}"  #change to 1e-4 for qwen2.5-0.5b, 5e-5 for qwen2.5-7b
+LEARNING_RATE="${LEARNING_RATE:-3e-5}"  # targeted closed-choice verifier 通常更适合更小学习率
 MAX_ERROR_TO_CLEAN_RATIO="${MAX_ERROR_TO_CLEAN_RATIO:-1.0}"
 NUM_EPOCHS="${NUM_EPOCHS:-8}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-384}"

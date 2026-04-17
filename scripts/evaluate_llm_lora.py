@@ -150,8 +150,20 @@ def parse_args():
     parser.add_argument("--adapter_path", default=None, help="LoRA adapter 目录；不传则只测基座模型")
     parser.add_argument("--data_path", required=True, help="测试数据路径；支持单个 jsonl、目录、或逗号分隔多个路径")
     parser.add_argument("--output_dir", default="./outputs/llm_eval", help="评测输出目录")
-    parser.add_argument("--task_type", default="auto", choices=["auto", "correction", "choice"],
-                        help="auto 自动识别；correction 直接纠错；choice 候选选择题")
+    parser.add_argument(
+        "--task_type",
+        default="auto",
+        choices=[
+            "auto",
+            "correction",
+            "choice",
+            "targeted_choice",
+            "targeted_choice_abstain",
+            "targeted_open_repair",
+            "targeted_recheck",
+        ],
+        help="auto 自动识别；其余分别对应不同 verifier 训练任务",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--use_4bit", action="store_true")
     parser.add_argument("--limit", type=int, default=-1, help="只评测前 N 条，-1 表示全量")
@@ -214,14 +226,24 @@ def detect_task_type(sample: dict, user_task_type: str) -> str:
     if user_task_type != "auto":
         return user_task_type
 
+    task_type = str(sample.get("task_type", "")).strip().lower()
+    if task_type == "targeted_choice":
+        return "targeted_choice"
+    if task_type == "targeted_choice_abstain":
+        return "targeted_choice_abstain"
+    if task_type == "targeted_open_repair":
+        return "targeted_open_repair"
+    if task_type == "targeted_recheck":
+        return "targeted_recheck"
+
     if "source" in sample and "target" in sample:
         return "correction"
     if "instruction" in sample and "output" in sample:
         return "choice"
 
     raise ValueError(
-        "无法自动识别任务类型。样本需要包含 {source,target} 或 {instruction,output} 字段，"
-        "或者手动传 --task_type correction|choice。"
+        "无法自动识别任务类型。样本需要包含 {source,target}、{instruction,output}，"
+        "或显式包含 task_type=targeted_choice；或者手动传 --task_type correction|choice|targeted_choice。"
     )
 
 
@@ -241,6 +263,10 @@ def build_choice_prompt(example: dict) -> str:
     if input_text:
         return f"User:\n{instruction}\n\n{input_text}\n\nAssistant:"
     return f"User:\n{instruction}\n\nAssistant:"
+
+
+def build_targeted_choice_prompt(example: dict) -> str:
+    return build_choice_prompt(example)
 
 
 def _truncate_at_chat_marker(text: str) -> str:
@@ -288,6 +314,28 @@ def parse_choice_prediction(text: str) -> Tuple[Optional[str], str]:
     normalized = unicodedata.normalize("NFKC", normalize_generation(text)).upper()
     for ch in normalized:
         if ch in string.ascii_uppercase:
+            return ch, normalized
+    return None, normalized
+
+
+def parse_targeted_choice_prediction(text: str) -> Tuple[Optional[str], str]:
+    normalized = unicodedata.normalize("NFKC", normalize_generation(text)).upper()
+    normalized = normalized.replace("，", ",").replace(" ", "")
+    segments = [seg for seg in normalized.split(",") if seg]
+    labels = []
+    for seg in segments:
+        label = next((ch for ch in seg if ch in string.ascii_uppercase), None)
+        if label is not None:
+            labels.append(label)
+    if not labels:
+        return None, normalized
+    return ",".join(labels), normalized
+
+
+def parse_single_char_prediction(text: str) -> Tuple[Optional[str], str]:
+    normalized = unicodedata.normalize("NFKC", normalize_generation(text)).strip()
+    for ch in normalized:
+        if '\u4e00' <= ch <= '\u9fff':
             return ch, normalized
     return None, normalized
 
@@ -396,6 +444,189 @@ def evaluate_choice(records: List[dict], model, tokenizer, max_new_tokens: int, 
         "invalid_predictions": invalid,
         "accuracy": correct / total if total > 0 else 0.0,
     }
+    return metrics, predictions, errors
+
+
+def evaluate_targeted_choice(records: List[dict], model, tokenizer, max_new_tokens: int, print_every: int):
+    predictions = []
+    errors = []
+    exact_correct = 0
+    invalid = 0
+    total_positions = 0
+    correct_positions = 0
+
+    for idx, example in enumerate(tqdm(records, desc="Evaluating targeted_choice"), start=1):
+        prompt = build_targeted_choice_prompt(example)
+        raw_output = generate_text(model, tokenizer, prompt, max_new_tokens=min(max_new_tokens, 16))
+        pred_seq, normalized_output = parse_targeted_choice_prediction(raw_output)
+        gold_seq = str(example["output"]).replace("，", ",").replace(" ", "").strip().upper()
+        is_correct = pred_seq == gold_seq
+
+        gold_labels = [x for x in gold_seq.split(",") if x]
+        pred_labels = [x for x in (pred_seq.split(",") if pred_seq else []) if x]
+        total_positions += len(gold_labels)
+        correct_positions += sum(1 for g, p in zip(gold_labels, pred_labels) if g == p)
+
+        if pred_seq is None:
+            invalid += 1
+        if is_correct:
+            exact_correct += 1
+
+        item = {
+            "instruction": example.get("instruction", ""),
+            "input": example.get("input", ""),
+            "gold": gold_seq,
+            "prediction": pred_seq,
+            "raw_output": raw_output,
+            "normalized_output": normalized_output,
+            "correct": is_correct,
+            "num_positions": example.get("num_positions"),
+            "num_non_keep": example.get("num_non_keep"),
+            "all_keep": example.get("all_keep"),
+        }
+        predictions.append(item)
+        if not is_correct:
+            errors.append(item)
+
+        if print_every > 0 and idx % print_every == 0:
+            print(f"[{idx}] gold={gold_seq} pred={pred_seq} raw={raw_output}")
+
+    total = len(records)
+    metrics = {
+        "task_type": "targeted_choice",
+        "num_samples": total,
+        "exact_correct": exact_correct,
+        "invalid_predictions": invalid,
+        "sequence_accuracy": exact_correct / total if total > 0 else 0.0,
+        "position_accuracy": correct_positions / total_positions if total_positions > 0 else 0.0,
+    }
+    return metrics, predictions, errors
+
+
+def evaluate_targeted_choice_abstain(records: List[dict], model, tokenizer, max_new_tokens: int, print_every: int):
+    predictions = []
+    errors = []
+    exact_correct = 0
+    invalid = 0
+    total_positions = 0
+    correct_positions = 0
+    total_abstain = 0
+    correct_abstain = 0
+    predicted_abstain = 0
+
+    for idx, example in enumerate(tqdm(records, desc="Evaluating targeted_choice_abstain"), start=1):
+        prompt = build_targeted_choice_prompt(example)
+        raw_output = generate_text(model, tokenizer, prompt, max_new_tokens=min(max_new_tokens, 16))
+        pred_seq, normalized_output = parse_targeted_choice_prediction(raw_output)
+        gold_seq = str(example["output"]).replace("，", ",").replace(" ", "").strip().upper()
+        is_correct = pred_seq == gold_seq
+
+        gold_labels = [x for x in gold_seq.split(",") if x]
+        pred_labels = [x for x in (pred_seq.split(",") if pred_seq else []) if x]
+        total_positions += len(gold_labels)
+        correct_positions += sum(1 for g, p in zip(gold_labels, pred_labels) if g == p)
+        total_abstain += sum(1 for label in gold_labels if label == "N")
+        correct_abstain += sum(1 for g, p in zip(gold_labels, pred_labels) if g == "N" and p == "N")
+        predicted_abstain += sum(1 for label in pred_labels if label == "N")
+
+        if pred_seq is None:
+            invalid += 1
+        if is_correct:
+            exact_correct += 1
+
+        item = {
+            "instruction": example.get("instruction", ""),
+            "input": example.get("input", ""),
+            "gold": gold_seq,
+            "prediction": pred_seq,
+            "raw_output": raw_output,
+            "normalized_output": normalized_output,
+            "correct": is_correct,
+            "num_positions": example.get("num_positions"),
+            "num_non_keep": example.get("num_non_keep"),
+            "num_abstain": example.get("num_abstain"),
+            "all_keep": example.get("all_keep"),
+        }
+        predictions.append(item)
+        if not is_correct:
+            errors.append(item)
+
+        if print_every > 0 and idx % print_every == 0:
+            print(f"[{idx}] gold={gold_seq} pred={pred_seq} raw={raw_output}")
+
+    total = len(records)
+    abstain_precision = correct_abstain / predicted_abstain if predicted_abstain > 0 else 0.0
+    abstain_recall = correct_abstain / total_abstain if total_abstain > 0 else 0.0
+    metrics = {
+        "task_type": "targeted_choice_abstain",
+        "num_samples": total,
+        "exact_correct": exact_correct,
+        "invalid_predictions": invalid,
+        "sequence_accuracy": exact_correct / total if total > 0 else 0.0,
+        "position_accuracy": correct_positions / total_positions if total_positions > 0 else 0.0,
+        "abstain_precision": abstain_precision,
+        "abstain_recall": abstain_recall,
+    }
+    return metrics, predictions, errors
+
+
+def evaluate_targeted_open_repair(records: List[dict], model, tokenizer, max_new_tokens: int, print_every: int):
+    predictions = []
+    errors = []
+    correct = 0
+    invalid = 0
+
+    for idx, example in enumerate(tqdm(records, desc="Evaluating targeted_open_repair"), start=1):
+        prompt = build_targeted_choice_prompt(example)
+        raw_output = generate_text(model, tokenizer, prompt, max_new_tokens=min(max_new_tokens, 4))
+        pred_char, normalized_output = parse_single_char_prediction(raw_output)
+        gold_char = str(example["output"]).strip()
+        is_correct = pred_char == gold_char
+
+        if pred_char is None:
+            invalid += 1
+        if is_correct:
+            correct += 1
+
+        item = {
+            "instruction": example.get("instruction", ""),
+            "input": example.get("input", ""),
+            "gold": gold_char,
+            "prediction": pred_char,
+            "raw_output": raw_output,
+            "normalized_output": normalized_output,
+            "correct": is_correct,
+            "position_index": example.get("position_index"),
+            "source_char": example.get("source_char"),
+            "target_char": example.get("target_char"),
+        }
+        predictions.append(item)
+        if not is_correct:
+            errors.append(item)
+
+        if print_every > 0 and idx % print_every == 0:
+            print(f"[{idx}] gold={gold_char} pred={pred_char} raw={raw_output}")
+
+    total = len(records)
+    metrics = {
+        "task_type": "targeted_open_repair",
+        "num_samples": total,
+        "correct": correct,
+        "invalid_predictions": invalid,
+        "accuracy": correct / total if total > 0 else 0.0,
+    }
+    return metrics, predictions, errors
+
+
+def evaluate_targeted_recheck(records: List[dict], model, tokenizer, max_new_tokens: int, print_every: int):
+    metrics, predictions, errors = evaluate_choice(
+        records=records,
+        model=model,
+        tokenizer=tokenizer,
+        max_new_tokens=max_new_tokens,
+        print_every=print_every,
+    )
+    metrics["task_type"] = "targeted_recheck"
     return metrics, predictions, errors
 
 
@@ -561,6 +792,38 @@ def main():
 
     if task_type == "choice":
         metrics, predictions, errors = evaluate_choice(
+            records=records,
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            print_every=args.print_every,
+        )
+    elif task_type == "targeted_choice_abstain":
+        metrics, predictions, errors = evaluate_targeted_choice_abstain(
+            records=records,
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            print_every=args.print_every,
+        )
+    elif task_type == "targeted_choice":
+        metrics, predictions, errors = evaluate_targeted_choice(
+            records=records,
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            print_every=args.print_every,
+        )
+    elif task_type == "targeted_open_repair":
+        metrics, predictions, errors = evaluate_targeted_open_repair(
+            records=records,
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            print_every=args.print_every,
+        )
+    elif task_type == "targeted_recheck":
+        metrics, predictions, errors = evaluate_targeted_recheck(
             records=records,
             model=model,
             tokenizer=tokenizer,

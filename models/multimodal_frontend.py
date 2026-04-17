@@ -70,7 +70,7 @@ class PinyinManualEmbeddings(nn.Module):
     def __init__(self, args):
         super(PinyinManualEmbeddings, self).__init__()
         self.args = args
-        self.max_len = 8  # handle pinyin representation length up to 8
+        self.max_len = 6  # Reverted back to 6 to match HuggingFace pretrained ckpt
         self.embedding_layer = nn.Linear(self.max_len, 6, bias=True)
 
     def forward(self, inputs):
@@ -113,8 +113,8 @@ class GlyphDenseEmbedding(nn.Module):
 
 
 class MultimodalCSCFrontend(pl.LightningModule):
-    bert_path = "hfl/chinese-macbert-base"
-    tokenizer = AutoTokenizer.from_pretrained(bert_path)
+    bert_path = "/home/bkai/cwq/MASC-CSC/ckpt/chinese-macbert-base"
+    tokenizer = AutoTokenizer.from_pretrained(bert_path, trust_remote_code=True)
 
     input_helper = InputHelper(tokenizer)
 
@@ -134,9 +134,12 @@ class MultimodalCSCFrontend(pl.LightningModule):
         self.bert_config.hidden_dropout_prob = dropout
 
         self.bert = AutoModel.from_pretrained(MultimodalCSCFrontend.bert_path, config=self.bert_config)
-        self._tokenizer = AutoTokenizer.from_pretrained(MultimodalCSCFrontend.bert_path)
+        self._tokenizer = AutoTokenizer.from_pretrained(MultimodalCSCFrontend.bert_path, trust_remote_code=True)
 
         self.token_forget_gate = nn.Linear(768, 768, bias=False)
+        self.pinyin_forget_gate = nn.Linear(768, 768, bias=False)
+        self.glyph_forget_gate = nn.Linear(768, 768, bias=False)
+        self.forget_gate_w = nn.Linear(768, 1, bias=False)
 
         self.pinyin_feature_size = 6
         self.pinyin_embeddings = PinyinManualEmbeddings(self.args)
@@ -258,7 +261,13 @@ class MultimodalCSCFrontend(pl.LightningModule):
     def _compute_entropy(probabilities: torch.Tensor) -> torch.Tensor:
         return -(probabilities * torch.log(probabilities.clamp_min(1e-12))).sum(dim=-1)
 
-    def predict_with_metadata(self, sentence: str, top_k: int = 5) -> Dict[str, List]:
+    def predict_with_metadata(self, sentence: str, top_k: int = 5,
+                               detection_threshold: float = 0.5) -> Dict[str, List]:
+        """
+        detection_threshold: 只有 detection_score（= 1 - copy_prob）超过此阈值的位置，
+        predicted_token 才允许与 source_token 不同。低于阈值的位置强制退回原字，
+        避免对高置信度正确字的误判（FP 爆炸的根本原因）。
+        """
         src_tokens, inputs, input_pinyins, images = self._prepare_single_sentence_inputs(sentence)
 
         with torch.no_grad():
@@ -277,9 +286,24 @@ class MultimodalCSCFrontend(pl.LightningModule):
         trimmed_topk_ids = topk_ids[0, 1:-1]
         trimmed_input_ids = input_ids[0, 1:-1]
 
-        copy_probs = trimmed_probs.gather(dim=-1, index=trimmed_input_ids.unsqueeze(-1)).squeeze(-1)
+        copy_probs_input = trimmed_probs.gather(dim=-1, index=trimmed_input_ids.unsqueeze(-1)).squeeze(-1)
+        # Token ID 1 [unused1] (and 0 [PAD]) is used by this model to signify "no error" / "keep token"
+        keep_probs_virtual = trimmed_probs[:, 1]
+        
+        # The true probability of not changing the token is the probability of predicting the token itself 
+        # plus the probability of predicting the "keep" token (1).
+        copy_probs = copy_probs_input + keep_probs_virtual
         detection_scores = 1.0 - copy_probs
         uncertainty_scores = self._compute_entropy(trimmed_probs)
+
+        # ── 关键过滤：检测分数不足时强制保留原字，防止误杀 ──
+        filtered_predicted_tokens = []
+        for i, (pred_tok, src_tok, det_score) in enumerate(
+                zip(predicted_tokens, src_tokens, detection_scores.tolist())):
+            if det_score >= detection_threshold:
+                filtered_predicted_tokens.append(pred_tok)
+            else:
+                filtered_predicted_tokens.append(src_tok)
 
         candidate_tokens = []
         for position_ids in trimmed_topk_ids:
@@ -288,8 +312,8 @@ class MultimodalCSCFrontend(pl.LightningModule):
         return {
             "source_text": ''.join(src_tokens),
             "source_tokens": src_tokens,
-            "predicted_tokens": predicted_tokens,
-            "predicted_text": ''.join(predicted_tokens),
+            "predicted_tokens": filtered_predicted_tokens,
+            "predicted_text": ''.join(filtered_predicted_tokens),
             "topk_ids": trimmed_topk_ids.detach().cpu().tolist(),
             "topk_probs": trimmed_topk_probs.detach().cpu().tolist(),
             "topk_tokens": candidate_tokens,
