@@ -50,6 +50,8 @@ def parse_args():
     parser.add_argument('--llm-adapter', type=str, default=None,
                         help='可选的 LoRA adapter 路径。')
     parser.add_argument('--llm-mode', type=str, default='targeted', choices=['targeted', 'choice'])
+    parser.add_argument('--targeted-stage', type=str, default='full', choices=['full', 'stage1_only'],
+                        help='当 llm-mode=targeted 时，指定 verifier 执行 full（三阶段）或 stage1_only。')
     parser.add_argument('--label-mode', type=str, default='llm-gain', choices=['llm-gain', 'frontend-error'],
                         help='llm-gain: 学习 LLM 净收益；frontend-error: 旧版前端错误检测基线。')
     parser.add_argument('--top-k', type=int, default=5)
@@ -256,7 +258,7 @@ def load_pairs(args):
 
 
 def build_verifier_for_device(label_mode: str, llm_path: Optional[str], llm_adapter: Optional[str], llm_mode: str,
-                              device: str):
+                              targeted_stage: str, device: str):
     if label_mode == 'frontend-error':
         return None
     if not llm_path:
@@ -266,6 +268,7 @@ def build_verifier_for_device(label_mode: str, llm_path: Optional[str], llm_adap
         adapter_path=llm_adapter,
         device=device,
         mode=llm_mode,
+        targeted_stage=targeted_stage,
     )
 
 
@@ -378,14 +381,14 @@ def shard_pairs(pairs: Sequence[Tuple[str, str]], num_shards: int) -> List[List[
 
 
 def _feature_worker_entry(payload):
-    worker_id, pairs, ckpt_path, frontend_device, label_mode, llm_path, llm_adapter, llm_mode, llm_device, top_k, feature_top_r, min_gain = payload
+    worker_id, pairs, ckpt_path, frontend_device, label_mode, llm_path, llm_adapter, llm_mode, targeted_stage, llm_device, top_k, feature_top_r, min_gain = payload
     worker_tag = f'worker-{worker_id}@{frontend_device}'
     torch.set_num_threads(1)
 
     frontend_model = load_frontend_model(ckpt_path, frontend_device)
     mechanism_inferencer = MechanismInferencer()
     candidate_generator = MechanismAwareCandidateGenerator(mechanism_inferencer=mechanism_inferencer)
-    verifier = build_verifier_for_device(label_mode, llm_path, llm_adapter, llm_mode, llm_device)
+    verifier = build_verifier_for_device(label_mode, llm_path, llm_adapter, llm_mode, targeted_stage, llm_device)
 
     features, labels, stats = collect_features_and_labels(
         frontend_model,
@@ -417,6 +420,7 @@ def collect_features_and_labels_parallel(pairs, args):
             args.llm_path,
             args.llm_adapter,
             args.llm_mode,
+            args.targeted_stage,
             args.llm_devices_list[worker_id],
             args.top_k,
             args.feature_top_r,
@@ -453,6 +457,7 @@ def collect_features_single_worker(pairs, args):
         args.llm_path,
         args.llm_adapter,
         args.llm_mode,
+        args.targeted_stage,
         args.llm_devices_list[0],
     )
 

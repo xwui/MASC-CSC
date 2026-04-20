@@ -198,6 +198,7 @@ class BaichuanLocalVerifier:
             torch_dtype=torch.float16,
             max_new_tokens: int = 1,
             mode: str = "targeted",
+            targeted_stage: str = "full",
     ):
         """
         Args:
@@ -207,13 +208,17 @@ class BaichuanLocalVerifier:
             torch_dtype: 模型精度 (torch.float16 / torch.bfloat16)
             max_new_tokens: 生成的最大 token 数（choice 模式下为 1）
             mode: 工作模式，"choice"（选择题）或 "targeted"（定点纠正）
+            targeted_stage: targeted 模式下执行 "full"（三阶段）或 "stage1_only"（只跑 stage1）
         """
         assert mode in ("choice", "targeted"), f"mode 必须是 'choice' 或 'targeted'，收到: {mode}"
+        assert targeted_stage in ("full", "stage1_only"), \
+            f"targeted_stage 必须是 'full' 或 'stage1_only'，收到: {targeted_stage}"
 
         logger.info("Loading LLM model from: %s (mode=%s)", model_path, mode)
         self.device = device
         self.max_new_tokens = max_new_tokens
         self.mode = mode
+        self.targeted_stage = targeted_stage
 
         # 加载 tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -965,6 +970,33 @@ class BaichuanLocalVerifier:
                 else:
                     correction_map[decision.position.index] = decision.selected_token or decision.position.source_token
                     decision_reasons[decision.position.index] = 'accepted_stage1_choice'
+
+            if self.targeted_stage == "stage1_only":
+                corrections = [
+                    correction_map.get(pos.index, pos.predicted_token if pos.is_edited else pos.source_token)
+                    for pos in suspicious_positions
+                ]
+                result = self._safe_merge_targeted_corrections(
+                    prediction,
+                    candidates,
+                    suspicious_positions,
+                    corrections,
+                    decision_reasons=decision_reasons,
+                )
+                stage1_abstain = sum(
+                    1 for reason in decision_reasons.values()
+                    if reason == 'stage1_abstain_keep'
+                )
+                stage1_accept = sum(
+                    1 for reason in decision_reasons.values()
+                    if reason == 'accepted_stage1_choice'
+                )
+                result.reason = (
+                    f"Stage1-only verifier: stage1_abstain={stage1_abstain}, "
+                    f"stage1_accepted={stage1_accept}. {result.reason}"
+                )
+                result.selected_source = 'llm-targeted-stage1-only'
+                return result
 
             stage2_proposals = self._run_stage2(prediction, stage1_decisions)
             for proposal in stage2_proposals:

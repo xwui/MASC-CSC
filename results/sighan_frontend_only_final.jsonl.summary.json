@@ -1,0 +1,13 @@
+{
+  "dataset": "./datasets/Sighan/sighan15_test.jsonl",
+  "total": 1100,
+  "accuracy": 0.8382,
+  "precision": 0.735,
+  "recall": 0.9587,
+  "f1": 0.8321,
+  "tp": 441,
+  "fp": 159,
+  "fn": 19,
+  "tn": 481,
+  "elapsed_seconds": 11.15
+}

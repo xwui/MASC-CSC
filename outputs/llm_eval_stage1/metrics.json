@@ -1,0 +1,13 @@
+{
+  "task_type": "targeted_choice_abstain",
+  "num_samples": 31702,
+  "exact_correct": 24685,
+  "invalid_predictions": 0,
+  "sequence_accuracy": 0.7786574979496562,
+  "position_accuracy": 0.8431348674865051,
+  "abstain_precision": 0.04551539491298527,
+  "abstain_recall": 0.028145695364238412,
+  "base_model": "./LLM/Qwen2.5-7B-Instruct",
+  "adapter_path": "./ckpt/llm_lora_qwen25_7b_stage1",
+  "data_path": "./data/llm_stage1_choice_abstain_train.jsonl"
+}

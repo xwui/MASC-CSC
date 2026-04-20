@@ -1,0 +1,63 @@
+{
+  "source_path": "/home/bkai/cwq/MASC-CSC/data/llm_stage1_choice_abstain_train.jsonl",
+  "output_path": "/home/bkai/cwq/MASC-CSC/data/llm_stage1_choice_abstain_v2_train.jsonl",
+  "generation_mode": "stage1-v2-rebuild-from-existing-stage1",
+  "raw_counts": {
+    "raw_total": 31702,
+    "raw_core_choice": 29776,
+    "raw_rare_choice": 751,
+    "raw_hard_n": 1175,
+    "core_invoke": 6734,
+    "core_skip": 23042,
+    "core_skip_retained": 1684,
+    "rare_selected": 751,
+    "hard_selected": 1175,
+    "easy_candidates": 4426,
+    "easy_selected": 2350,
+    "easy_target_from_ratio": 444,
+    "easy_target_from_hard": 2350,
+    "easy_target_final": 2350
+  },
+  "final_num_samples": 12694,
+  "final_total_positions": 19772,
+  "sample_type_counter": {
+    "core-choice": 8418,
+    "easy-N": 2350,
+    "hard-N": 1175,
+    "rare-choice": 751
+  },
+  "contains_n_counter": {
+    "true": 3525,
+    "false": 9169
+  },
+  "num_positions_counter": {
+    "1": 7133,
+    "2": 4044,
+    "3": 1517
+  },
+  "router_invoke_counter": {
+    "true": 8531,
+    "false": 4163
+  },
+  "label_counter": {
+    "A": 11168,
+    "B": 4206,
+    "C": 593,
+    "D": 247,
+    "N": 3558
+  },
+  "label_ratio": {
+    "A": 0.5648391664980781,
+    "B": 0.2127250657495448,
+    "C": 0.029991907748330972,
+    "D": 0.012492413514060286,
+    "N": 0.17995144648998584
+  },
+  "params": {
+    "seed": 42,
+    "skip_core_ratio": 0.25,
+    "target_n_sample_ratio": 0.15,
+    "easy_to_hard_ratio": 2.0,
+    "target_rare_ratio": 0.06
+  }
+}

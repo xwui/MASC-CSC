@@ -33,6 +33,7 @@ LABEL_MODE="${LABEL_MODE:-llm-gain}"   # llm-gain / frontend-error
 LLM_PATH="${LLM_PATH:-./LLM/Qwen2.5-7B-Instruct}"
 LLM_ADAPTER="${LLM_ADAPTER:-}"
 LLM_MODE="${LLM_MODE:-targeted}"
+TARGETED_STAGE="${TARGETED_STAGE:-full}"
 
 TOP_K="${TOP_K:-5}"
 FEATURE_TOP_R="${FEATURE_TOP_R:-3}"
@@ -143,6 +144,7 @@ if [ "${LABEL_MODE}" = "llm-gain" ]; then
     COMMON_ARGS+=(
         --llm-path "${LLM_PATH}"
         --llm-mode "${LLM_MODE}"
+        --targeted-stage "${TARGETED_STAGE}"
     )
     if [ -n "${LLM_ADAPTER}" ]; then
         COMMON_ARGS+=(--llm-adapter "${LLM_ADAPTER}")

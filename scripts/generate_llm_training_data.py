@@ -10,8 +10,10 @@ Supported stages:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
+import random
 import string
 import sys
 from pathlib import Path
@@ -44,6 +46,21 @@ MECHANISM_LABEL_ZH = {
     ErrorMechanism.UNCERTAIN: "不确定",
 }
 
+NOISY_SUBSTITUTION_PAIRS = {
+    ("的", "得"),
+    ("得", "的"),
+    ("余", "馀"),
+    ("馀", "余"),
+    ("作", "做"),
+    ("做", "作"),
+    ("惟", "唯"),
+    ("唯", "惟"),
+    ("他", "她"),
+    ("她", "他"),
+    ("妳", "你"),
+    ("你", "妳"),
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate targeted closed-choice LoRA training data.")
@@ -70,6 +87,27 @@ def parse_args():
                         help="默认只保留 router 决定 invoke_llm 的样本；开启后也保留 skip 样本")
     parser.add_argument("--allow-missing-gold", action="store_true",
                         help="兼容旧版参数；staged 生成中 stage1 会保留为 N，stage2/3 会转成后续阶段样本")
+    parser.add_argument("--stage1-skip-core-ratio", type=float, default=0.25,
+                        help="stage1-v2 中保留 skip core-choice 样本的比例上限，相对于 invoke core-choice 样本数")
+    parser.add_argument("--stage1-target-n-sample-ratio", type=float, default=0.15,
+                        help="stage1-v2 目标中，包含 N 的样本占比")
+    parser.add_argument("--stage1-easy-to-hard-ratio", type=float, default=2.0,
+                        help="stage1-v2 中 synthetic easy-N 与 hard-N 的目标比例")
+    parser.add_argument("--stage1-target-rare-ratio", type=float, default=0.06,
+                        help="stage1-v2 中 rare-choice 样本相对 core-choice 的目标比例")
+    parser.add_argument("--stage1-build-mode", type=str, default="v2", choices=["v2", "v3"],
+                        help="stage1 数据构建模式：v2 为 easy-N/rare 版本，v3 为 router-invoke 四桶版本")
+    parser.add_argument("--stage1-rebuild-from", type=str, default=None,
+                        help="从已有 stage1 JSONL 直接重构 stage1 数据，跳过前端/router 重跑")
+    parser.add_argument("--stage1-v3-keep-hard-ratio", type=float, default=0.35,
+                        help="stage1-v3 中 keep-hard 桶的目标比例")
+    parser.add_argument("--stage1-v3-choice-hard-ratio", type=float, default=0.40,
+                        help="stage1-v3 中 choice-hard 桶的目标比例")
+    parser.add_argument("--stage1-v3-abstain-hard-ratio", type=float, default=0.15,
+                        help="stage1-v3 中 abstain-hard 桶的目标比例")
+    parser.add_argument("--stage1-v3-noisy-negative-ratio", type=float, default=0.10,
+                        help="stage1-v3 中 noisy-negative 桶的目标比例")
+    parser.add_argument("--seed", type=int, default=42, help="stage1-v2 采样随机种子")
     return parser.parse_args()
 
 
@@ -398,6 +436,404 @@ def build_stage1_sample(
     }
 
 
+def build_stage1_instance(
+    source_text: str,
+    target_text: str,
+    prediction: SentencePrediction,
+    suspicious_positions: List[PositionPrediction],
+    max_options_per_position: int,
+    routing,
+) -> Optional[dict]:
+    if len(source_text) != len(target_text):
+        return None
+
+    active_positions: List[SimpleNamespace] = []
+    option_lists: List[List[str]] = []
+    labels: List[str] = []
+
+    for pos in suspicious_positions:
+        if not is_single_chinese_char(source_text[pos.index]):
+            continue
+
+        options = build_targeted_options(pos, max_options=max_options_per_position)
+        if len(options) <= 1:
+            continue
+
+        gold_char = target_text[pos.index]
+        if gold_char not in options:
+            label = "N"
+        else:
+            label = string.ascii_uppercase[options.index(gold_char)]
+
+        active_positions.append(
+            SimpleNamespace(
+                index=pos.index,
+                source_token=pos.source_token,
+                predicted_token=pos.predicted_token,
+                mechanism=pos.mechanism,
+            )
+        )
+        option_lists.append(list(options))
+        labels.append(label)
+
+    if not active_positions:
+        return None
+
+    return {
+        "source_text": source_text,
+        "target_text": target_text,
+        "predicted_text": prediction.predicted_text,
+        "active_positions": active_positions,
+        "option_lists": option_lists,
+        "labels": labels,
+        "router_invoke": bool(routing.invoke_llm),
+        "router_risk": float(routing.risk_score),
+        "router_reasons": list(routing.reasons),
+        "suspicious_indices": [pos.index for pos in active_positions],
+    }
+
+
+def classify_stage1_instance(instance: dict) -> str:
+    labels = instance["labels"]
+    if "N" in labels:
+        return "hard-N"
+    if any(label in {"C", "D"} for label in labels):
+        return "rare-choice"
+    return "core-choice"
+
+
+def _stage1_prompt_from_instance(instance: dict, option_lists: List[List[str]]) -> str:
+    prediction_stub = SimpleNamespace(source_text=instance["source_text"])
+    return build_targeted_prompt(
+        prediction_stub,
+        instance["active_positions"],
+        option_lists,
+        allow_abstain=True,
+        stage_name="第一阶段",
+    )
+
+
+def materialize_stage1_sample(instance: dict, sample_type: str, synthetic_n: bool = False) -> dict:
+    option_lists = copy.deepcopy(instance["option_lists"])
+    labels = list(instance["labels"])
+    prompt = _stage1_prompt_from_instance(instance, option_lists)
+    num_non_keep = sum(1 for label in labels if label != "A")
+    num_abstain = sum(1 for label in labels if label == "N")
+    return {
+        "task_type": "targeted_choice_abstain",
+        "instruction": "请完成中文拼写纠错的定点闭集验证，只输出逗号分隔的字母序列；必要时可输出 N。",
+        "input": prompt,
+        "output": ",".join(labels),
+        "source": instance["source_text"],
+        "target": instance["target_text"],
+        "frontend_prediction": instance["predicted_text"],
+        "num_positions": len(labels),
+        "num_non_keep": num_non_keep,
+        "num_abstain": num_abstain,
+        "all_keep": num_non_keep == 0,
+        "sample_label": 0 if num_non_keep == 0 else 1,
+        "suspicious_indices": list(instance["suspicious_indices"]),
+        "option_lists": option_lists,
+        "sample_type": sample_type,
+        "synthetic_n": synthetic_n,
+        "contains_N": num_abstain > 0,
+        "task_stage": "stage1",
+        "router_invoke": instance["router_invoke"],
+        "router_risk": instance["router_risk"],
+        "router_reasons": list(instance["router_reasons"]),
+    }
+
+
+def build_stage1_easy_n_variants(instance: dict) -> List[dict]:
+    variants: List[dict] = []
+    for pos_idx, label in enumerate(instance["labels"]):
+        if label not in {"B", "C", "D"}:
+            continue
+        gold_option_index = string.ascii_uppercase.index(label)
+        options = instance["option_lists"][pos_idx]
+        if gold_option_index >= len(options):
+            continue
+
+        mutated = {
+            "source_text": instance["source_text"],
+            "target_text": instance["target_text"],
+            "predicted_text": instance["predicted_text"],
+            "active_positions": instance["active_positions"],
+            "option_lists": copy.deepcopy(instance["option_lists"]),
+            "labels": list(instance["labels"]),
+            "router_invoke": instance["router_invoke"],
+            "router_risk": instance["router_risk"],
+            "router_reasons": list(instance["router_reasons"]),
+            "suspicious_indices": list(instance["suspicious_indices"]),
+        }
+        mutated["option_lists"][pos_idx].pop(gold_option_index)
+        mutated["labels"][pos_idx] = "N"
+        variants.append(mutated)
+    return variants
+
+
+def _sample_with_optional_replacement(items: List[dict], target_count: int, rng: random.Random) -> List[dict]:
+    if target_count <= 0 or not items:
+        return []
+    if target_count <= len(items):
+        return rng.sample(items, target_count)
+    selected = list(items)
+    selected.extend(rng.choice(items) for _ in range(target_count - len(items)))
+    return selected
+
+
+def _sample_without_replacement(items: List[dict], target_count: int, rng: random.Random) -> List[dict]:
+    if target_count <= 0 or not items:
+        return []
+    if target_count >= len(items):
+        return list(items)
+    return rng.sample(items, target_count)
+
+
+def summarize_stage1_samples(samples: List[dict], raw_counts: dict) -> dict:
+    label_counter = {label: 0 for label in ["A", "B", "C", "D", "N"]}
+    sample_type_counter = {}
+    num_positions_counter = {}
+    contains_n_counter = {"true": 0, "false": 0}
+    router_invoke_counter = {"true": 0, "false": 0}
+
+    total_positions = 0
+    for sample in samples:
+        sample_type = sample.get("sample_type", "unknown")
+        sample_type_counter[sample_type] = sample_type_counter.get(sample_type, 0) + 1
+        num_positions = int(sample.get("num_positions", 0))
+        num_positions_counter[str(num_positions)] = num_positions_counter.get(str(num_positions), 0) + 1
+        contains_n_counter["true" if sample.get("contains_N") else "false"] += 1
+        router_invoke_counter["true" if sample.get("router_invoke") else "false"] += 1
+        labels = [lb for lb in str(sample.get("output", "")).split(",") if lb]
+        total_positions += len(labels)
+        for lb in labels:
+            label_counter[lb] = label_counter.get(lb, 0) + 1
+
+    label_ratio = {
+        label: (count / total_positions if total_positions else 0.0)
+        for label, count in label_counter.items()
+    }
+    return {
+        "raw_counts": raw_counts,
+        "final_num_samples": len(samples),
+        "final_total_positions": total_positions,
+        "sample_type_counter": sample_type_counter,
+        "num_positions_counter": num_positions_counter,
+        "contains_n_counter": contains_n_counter,
+        "router_invoke_counter": router_invoke_counter,
+        "label_counter": label_counter,
+        "label_ratio": label_ratio,
+    }
+
+
+def _split_labels(sample: dict) -> List[str]:
+    return [label for label in str(sample.get("output", "")).split(",") if label]
+
+
+def _active_position_tuples(sample: dict) -> List[Tuple[int, str, str, str]]:
+    source_text = sample["source"]
+    target_text = sample["target"]
+    suspicious_indices = list(sample.get("suspicious_indices", []))
+    labels = _split_labels(sample)
+    tuples: List[Tuple[int, str, str, str]] = []
+    for local_idx, index in enumerate(suspicious_indices):
+        if not (0 <= index < len(source_text) and 0 <= index < len(target_text)):
+            continue
+        label = labels[local_idx] if local_idx < len(labels) else ""
+        tuples.append((index, source_text[index], target_text[index], label))
+    return tuples
+
+
+def _noisy_label_positions(sample: dict) -> List[int]:
+    positions: List[int] = []
+    for local_idx, _, source_char, target_char, label in [
+        (i, idx, src, tgt, lb) for i, (idx, src, tgt, lb) in enumerate(_active_position_tuples(sample))
+    ]:
+        if label in {"B", "C", "D"} and (source_char, target_char) in NOISY_SUBSTITUTION_PAIRS:
+            positions.append(local_idx)
+    return positions
+
+
+def materialize_stage1_v3_sample(sample: dict, sample_type: str) -> dict:
+    result = copy.deepcopy(sample)
+    labels = _split_labels(result)
+    if sample_type == "noisy-negative":
+        for local_idx in _noisy_label_positions(result):
+            if local_idx < len(labels):
+                labels[local_idx] = "A"
+    result["output"] = ",".join(labels)
+    result["num_positions"] = len(labels)
+    result["num_non_keep"] = sum(1 for label in labels if label != "A")
+    result["num_abstain"] = sum(1 for label in labels if label == "N")
+    result["all_keep"] = result["num_non_keep"] == 0
+    result["sample_label"] = 0 if result["all_keep"] else 1
+    result["contains_N"] = result["num_abstain"] > 0
+    result["sample_type"] = sample_type
+    result["synthetic_n"] = False
+    result["task_stage"] = "stage1"
+    result["stage1_build_mode"] = "v3"
+    result["router_invoke"] = bool(result.get("router_invoke", False))
+    return result
+
+
+def classify_stage1_v3_sample(sample: dict) -> Optional[str]:
+    if not bool(sample.get("router_invoke", False)):
+        return None
+    labels = _split_labels(sample)
+    if not labels:
+        return None
+    if _noisy_label_positions(sample):
+        return "noisy-negative"
+    if "N" in labels:
+        return "abstain-hard"
+    if all(label == "A" for label in labels):
+        return "keep-hard"
+    return "choice-hard"
+
+
+def summarize_stage1_bucket_profile(pools: dict[str, List[dict]]) -> dict:
+    profile = {}
+    for bucket, items in pools.items():
+        label_counter = {label: 0 for label in ["A", "B", "C", "D", "N"]}
+        total_positions = 0
+        for item in items:
+            labels = _split_labels(item)
+            total_positions += len(labels)
+            for label in labels:
+                label_counter[label] = label_counter.get(label, 0) + 1
+        profile[bucket] = {
+            "samples": len(items),
+            "positions": total_positions,
+            "label_counter": label_counter,
+        }
+    return profile
+
+
+def build_stage1_v3_dataset_from_samples(samples: List[dict], args) -> Tuple[List[dict], dict]:
+    rng = random.Random(args.seed)
+
+    pools = {
+        "keep-hard": [],
+        "choice-hard": [],
+        "abstain-hard": [],
+        "noisy-negative": [],
+    }
+    skipped_non_invoke = 0
+    for sample in samples:
+        bucket = classify_stage1_v3_sample(sample)
+        if bucket is None:
+            skipped_non_invoke += 1
+            continue
+        pools[bucket].append(sample)
+
+    invoke_total = sum(len(items) for items in pools.values())
+    ratio_config = {
+        "keep-hard": max(args.stage1_v3_keep_hard_ratio, 0.0),
+        "choice-hard": max(args.stage1_v3_choice_hard_ratio, 0.0),
+        "abstain-hard": max(args.stage1_v3_abstain_hard_ratio, 0.0),
+        "noisy-negative": max(args.stage1_v3_noisy_negative_ratio, 0.0),
+    }
+    ratio_sum = sum(ratio_config.values()) or 1.0
+    normalized = {bucket: value / ratio_sum for bucket, value in ratio_config.items()}
+
+    targets = {
+        bucket: int(round(invoke_total * normalized[bucket]))
+        for bucket in normalized
+    }
+    assigned = sum(targets.values())
+    if assigned != invoke_total:
+        targets["choice-hard"] += invoke_total - assigned
+
+    final_samples: List[dict] = []
+    final_bucket_counter = {}
+    for bucket, target_count in targets.items():
+        selected = _sample_with_optional_replacement(pools[bucket], target_count, rng)
+        final_bucket_counter[bucket] = len(selected)
+        for item in selected:
+            final_samples.append(materialize_stage1_v3_sample(item, sample_type=bucket))
+
+    rng.shuffle(final_samples)
+
+    raw_counts = {
+        "raw_total": len(samples),
+        "raw_invoke_total": invoke_total,
+        "raw_non_invoke_skipped": skipped_non_invoke,
+        "target_bucket_counts": targets,
+        "final_bucket_counts": final_bucket_counter,
+    }
+    summary = summarize_stage1_samples(final_samples, raw_counts)
+    summary["raw_bucket_profile"] = summarize_stage1_bucket_profile(pools)
+    summary["bucket_ratio_config"] = normalized
+    return final_samples, summary
+
+
+def build_stage1_v2_dataset(instances: List[dict], args) -> Tuple[List[dict], dict]:
+    rng = random.Random(args.seed)
+
+    core_all: List[dict] = []
+    rare_all: List[dict] = []
+    hard_n_all: List[dict] = []
+    for instance in instances:
+        bucket = classify_stage1_instance(instance)
+        if bucket == "hard-N":
+            hard_n_all.append(instance)
+        elif bucket == "rare-choice":
+            rare_all.append(instance)
+        else:
+            core_all.append(instance)
+
+    core_invoke = [inst for inst in core_all if inst["router_invoke"]]
+    core_skip = [inst for inst in core_all if not inst["router_invoke"]]
+    max_skip_core = int(round(len(core_invoke) * max(args.stage1_skip_core_ratio, 0.0)))
+    retained_skip = _sample_without_replacement(core_skip, max_skip_core, rng)
+    core_selected = list(core_invoke) + retained_skip
+
+    rare_target = max(len(rare_all), int(round(len(core_selected) * max(args.stage1_target_rare_ratio, 0.0))))
+    rare_selected = _sample_with_optional_replacement(rare_all, rare_target, rng)
+    hard_selected = list(hard_n_all)
+
+    easy_candidates: List[dict] = []
+    for instance in core_selected + rare_selected:
+        easy_candidates.extend(build_stage1_easy_n_variants(instance))
+
+    base_non_n_count = len(core_selected) + len(rare_selected)
+    hard_n_count = len(hard_selected)
+    target_n_ratio = min(max(args.stage1_target_n_sample_ratio, 0.0), 0.95)
+    easy_target_from_ratio = 0
+    if target_n_ratio > 0:
+        numerator = target_n_ratio * (base_non_n_count + hard_n_count) - hard_n_count
+        easy_target_from_ratio = max(0, math.ceil(numerator / max(1e-6, 1.0 - target_n_ratio)))
+    easy_target_from_hard = int(round(hard_n_count * max(args.stage1_easy_to_hard_ratio, 0.0)))
+    easy_target = max(easy_target_from_ratio, easy_target_from_hard)
+    easy_selected = _sample_with_optional_replacement(easy_candidates, easy_target, rng)
+
+    samples: List[dict] = []
+    samples.extend(materialize_stage1_sample(instance, sample_type="core-choice") for instance in core_selected)
+    samples.extend(materialize_stage1_sample(instance, sample_type="rare-choice") for instance in rare_selected)
+    samples.extend(materialize_stage1_sample(instance, sample_type="hard-N") for instance in hard_selected)
+    samples.extend(materialize_stage1_sample(instance, sample_type="easy-N", synthetic_n=True) for instance in easy_selected)
+    rng.shuffle(samples)
+
+    raw_counts = {
+        "raw_total": len(instances),
+        "raw_core_choice": len(core_all),
+        "raw_rare_choice": len(rare_all),
+        "raw_hard_n": len(hard_n_all),
+        "core_invoke": len(core_invoke),
+        "core_skip": len(core_skip),
+        "core_skip_retained": len(retained_skip),
+        "rare_selected": len(rare_selected),
+        "hard_selected": len(hard_selected),
+        "easy_candidates": len(easy_candidates),
+        "easy_selected": len(easy_selected),
+        "easy_target_from_ratio": easy_target_from_ratio,
+        "easy_target_from_hard": easy_target_from_hard,
+        "easy_target_final": easy_target,
+    }
+    return samples, summarize_stage1_samples(samples, raw_counts)
+
+
 def build_stage2_samples(
     source_text: str,
     target_text: str,
@@ -526,17 +962,6 @@ def build_stage3_samples(
 def main():
     args = parse_args()
 
-    print("[*] Loading frontend...")
-    frontend_model = load_frontend_model(args.frontend_path, args.device)
-    mechanism_inferencer = MechanismInferencer()
-    router = SelectiveEscalationRouter(
-        checkpoint_path=args.router_ckpt,
-        llm_invoke_threshold=args.router_threshold,
-        proposal_budget=args.proposal_budget,
-        device=args.device,
-    )
-
-    data_files = resolve_data_files(args.data_path)
     total = 0
     saved = 0
     skipped_skip = 0
@@ -547,6 +972,127 @@ def main():
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.task_stage == "stage1":
+        if args.stage1_rebuild_from:
+            rebuild_path = Path(args.stage1_rebuild_from)
+            if not rebuild_path.exists():
+                raise FileNotFoundError(f"找不到 stage1 重构输入文件：{rebuild_path}")
+            with open(rebuild_path, "r", encoding="utf-8") as fin:
+                rebuild_samples = [json.loads(line) for line in fin if line.strip()]
+            total = len(rebuild_samples)
+            if args.stage1_build_mode != "v3":
+                raise ValueError("当前从已有 stage1 JSONL 重构仅支持 --stage1-build-mode v3")
+            stage1_samples, stage1_summary = build_stage1_v3_dataset_from_samples(rebuild_samples, args)
+            with open(output_path, "w", encoding="utf-8") as fout:
+                for sample in stage1_samples:
+                    fout.write(json.dumps(_sanitize_for_json(sample), ensure_ascii=False) + "\n")
+            summary_path = Path(str(output_path) + ".summary.json")
+            full_summary = {
+                "task_stage": "stage1",
+                "generation_mode": "stage1-v3",
+                "rebuild_from": str(rebuild_path),
+                "total_records_seen": total,
+                "saved": len(stage1_samples),
+                "stage1_summary": stage1_summary,
+            }
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(_sanitize_for_json(full_summary), f, ensure_ascii=False, indent=2)
+
+            print("\n[*] Stage1 rebuild completed:")
+            print(f"  Source samples: {total}")
+            print(f"  Saved: {len(stage1_samples)}")
+            print(f"  Summary: {summary_path}")
+            return
+
+        print("[*] Loading frontend...")
+        frontend_model = load_frontend_model(args.frontend_path, args.device)
+        mechanism_inferencer = MechanismInferencer()
+        router = SelectiveEscalationRouter(
+            checkpoint_path=args.router_ckpt,
+            llm_invoke_threshold=args.router_threshold,
+            proposal_budget=args.proposal_budget,
+            device=args.device,
+        )
+        data_files = resolve_data_files(args.data_path)
+        stage1_instances: List[dict] = []
+        for src, tgt in tqdm(iter_records(data_files, limit=args.limit), desc="Collecting stage1 instance pool"):
+            total += 1
+            if len(src) != len(tgt):
+                skipped_len += 1
+                continue
+
+            metadata = frontend_model.predict_with_metadata(src, top_k=args.top_k)
+            prediction = build_sentence_prediction(metadata, mechanism_inferencer)
+            routing = router.decide(prediction)
+
+            if (not args.include_skip_samples) and (not routing.invoke_llm):
+                skipped_skip += 1
+                continue
+
+            suspicious_positions = get_suspicious_positions(prediction, selected_positions=routing.supplement_positions)
+            if not suspicious_positions:
+                skipped_no_positions += 1
+                continue
+
+            instance = build_stage1_instance(
+                source_text=src,
+                target_text=tgt,
+                prediction=prediction,
+                suspicious_positions=suspicious_positions,
+                max_options_per_position=args.max_options_per_position,
+                routing=routing,
+            )
+            if instance is None:
+                skipped_stage_empty += 1
+                continue
+            stage1_instances.append(instance)
+
+        if args.stage1_build_mode == "v2":
+            stage1_samples, stage1_summary = build_stage1_v2_dataset(stage1_instances, args)
+            generation_mode = "stage1-v2"
+        else:
+            base_stage1_samples = [
+                materialize_stage1_sample(instance, sample_type="raw-stage1")
+                for instance in stage1_instances
+            ]
+            stage1_samples, stage1_summary = build_stage1_v3_dataset_from_samples(base_stage1_samples, args)
+            generation_mode = "stage1-v3"
+        with open(output_path, "w", encoding="utf-8") as fout:
+            for sample in stage1_samples:
+                safe_sample = _sanitize_for_json(sample)
+                fout.write(json.dumps(safe_sample, ensure_ascii=False) + "\n")
+        summary_path = Path(str(output_path) + ".summary.json")
+        full_summary = {
+            "task_stage": "stage1",
+            "generation_mode": generation_mode,
+            "total_records_seen": total,
+            "saved": len(stage1_samples),
+            "skipped_len": skipped_len,
+            "skipped_skip": skipped_skip,
+            "skipped_no_positions": skipped_no_positions,
+            "skipped_stage_empty": skipped_stage_empty,
+            "stage1_summary": stage1_summary,
+        }
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(_sanitize_for_json(full_summary), f, ensure_ascii=False, indent=2)
+
+        print(f"\n[*] {generation_mode} generation completed:")
+        print(f"  Total processed: {total}")
+        print(f"  Saved: {len(stage1_samples)}")
+        print(f"  Summary: {summary_path}")
+        return
+
+    print("[*] Loading frontend...")
+    frontend_model = load_frontend_model(args.frontend_path, args.device)
+    mechanism_inferencer = MechanismInferencer()
+    router = SelectiveEscalationRouter(
+        checkpoint_path=args.router_ckpt,
+        llm_invoke_threshold=args.router_threshold,
+        proposal_budget=args.proposal_budget,
+        device=args.device,
+    )
+    data_files = resolve_data_files(args.data_path)
 
     with open(output_path, "w", encoding="utf-8") as fout:
         for src, tgt in tqdm(iter_records(data_files, limit=args.limit), desc="Generating targeted-choice data"):

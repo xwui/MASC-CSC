@@ -1,0 +1,113 @@
+{
+  "task_stage": "stage1",
+  "generation_mode": "stage1-v3",
+  "rebuild_from": "data/llm_stage1_choice_abstain_train.jsonl",
+  "total_records_seen": 31702,
+  "saved": 7132,
+  "stage1_summary": {
+    "raw_counts": {
+      "raw_total": 31702,
+      "raw_invoke_total": 7132,
+      "raw_non_invoke_skipped": 24570,
+      "target_bucket_counts": {
+        "keep-hard": 2496,
+        "choice-hard": 2853,
+        "abstain-hard": 1070,
+        "noisy-negative": 713
+      },
+      "final_bucket_counts": {
+        "keep-hard": 2496,
+        "choice-hard": 2853,
+        "abstain-hard": 1070,
+        "noisy-negative": 713
+      }
+    },
+    "final_num_samples": 7132,
+    "final_total_positions": 10725,
+    "sample_type_counter": {
+      "choice-hard": 2853,
+      "abstain-hard": 1070,
+      "noisy-negative": 713,
+      "keep-hard": 2496
+    },
+    "num_positions_counter": {
+      "2": 2189,
+      "1": 4241,
+      "3": 702
+    },
+    "contains_n_counter": {
+      "true": 1070,
+      "false": 6062
+    },
+    "router_invoke_counter": {
+      "true": 7132,
+      "false": 0
+    },
+    "label_counter": {
+      "A": 6565,
+      "B": 2824,
+      "C": 202,
+      "D": 64,
+      "N": 1070
+    },
+    "label_ratio": {
+      "A": 0.6121212121212121,
+      "B": 0.2633100233100233,
+      "C": 0.018834498834498836,
+      "D": 0.005967365967365967,
+      "N": 0.09976689976689977
+    },
+    "raw_bucket_profile": {
+      "keep-hard": {
+        "samples": 4450,
+        "positions": 6400,
+        "label_counter": {
+          "A": 6400,
+          "B": 0,
+          "C": 0,
+          "D": 0,
+          "N": 0
+        }
+      },
+      "choice-hard": {
+        "samples": 2271,
+        "positions": 3654,
+        "label_counter": {
+          "A": 1257,
+          "B": 2193,
+          "C": 152,
+          "D": 52,
+          "N": 0
+        }
+      },
+      "abstain-hard": {
+        "samples": 193,
+        "positions": 246,
+        "label_counter": {
+          "A": 47,
+          "B": 5,
+          "C": 1,
+          "D": 0,
+          "N": 193
+        }
+      },
+      "noisy-negative": {
+        "samples": 218,
+        "positions": 380,
+        "label_counter": {
+          "A": 140,
+          "B": 239,
+          "C": 1,
+          "D": 0,
+          "N": 0
+        }
+      }
+    },
+    "bucket_ratio_config": {
+      "keep-hard": 0.35,
+      "choice-hard": 0.4,
+      "abstain-hard": 0.15,
+      "noisy-negative": 0.1
+    }
+  }
+}

@@ -7,6 +7,51 @@ import unicodedata
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+
+def _ensure_cuda_runtime_env():
+    env = os.environ.copy()
+    updated = False
+
+    required_lib_dirs = [
+        "/home/bkai/anaconda3/envs/cwq_masc_csc/lib",
+        "/home/bkai/anaconda3/envs/cwq_masc_csc/lib/python3.10/site-packages/nvidia/cusparse/lib",
+        "/home/bkai/anaconda3/envs/cwq_masc_csc/lib/python3.10/site-packages/nvidia/cuda_runtime/lib",
+    ]
+    current_ld = env.get("LD_LIBRARY_PATH", "")
+    ld_parts = [part for part in current_ld.split(":") if part]
+    for lib_dir in reversed(required_lib_dirs):
+        if lib_dir and lib_dir not in ld_parts:
+            ld_parts.insert(0, lib_dir)
+            updated = True
+    env["LD_LIBRARY_PATH"] = ":".join(ld_parts)
+
+    current_pythonpath = env.get("PYTHONPATH", "")
+    py_parts = [part for part in current_pythonpath.split(":") if part]
+    if "/home/bkai/cwq/packages" not in py_parts:
+        py_parts.insert(0, "/home/bkai/cwq/packages")
+        env["PYTHONPATH"] = ":".join(py_parts)
+        updated = True
+
+    if env.get("TOKENIZERS_PARALLELISM") != "false":
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        updated = True
+
+    if updated and env.get("MASC_EVAL_ENV_READY") != "1":
+        env["MASC_EVAL_ENV_READY"] = "1"
+        os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+
+    os.environ.update(
+        {
+            "LD_LIBRARY_PATH": env["LD_LIBRARY_PATH"],
+            "PYTHONPATH": env.get("PYTHONPATH", ""),
+            "TOKENIZERS_PARALLELISM": env["TOKENIZERS_PARALLELISM"],
+            "MASC_EVAL_ENV_READY": env.get("MASC_EVAL_ENV_READY", "0"),
+        }
+    )
+
+
+_ensure_cuda_runtime_env()
+
 import torch
 from peft import PeftModel
 from tqdm import tqdm

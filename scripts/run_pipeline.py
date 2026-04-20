@@ -90,6 +90,9 @@ def parse_args():
     parser.add_argument("--llm-mode", type=str, default="targeted",
                         choices=["targeted", "choice"],
                         help="LLM 工作模式: targeted(定点纠正) / choice(选择题)")
+    parser.add_argument("--targeted-stage", type=str, default="full",
+                        choices=["full", "stage1_only"],
+                        help="targeted 模式下的执行阶段：full(默认三阶段) / stage1_only(只跑 stage1，N 直接回退原字)")
     parser.add_argument("--no-llm", action="store_true",
                         help="禁用 LLM，即使 Router 判定需要也跳过")
 
@@ -196,8 +199,12 @@ def build_pipeline(args):
             adapter_path=args.llm_adapter,
             device=llm_device,
             mode=args.llm_mode,
+            targeted_stage=args.targeted_stage,
         )
-        print(f"  → LLM Verifier (model: {args.llm_path}, mode: {args.llm_mode})")
+        print(
+            f"  → LLM Verifier (model: {args.llm_path}, mode: {args.llm_mode}, "
+            f"targeted_stage: {args.targeted_stage})"
+        )
 
     # 组装 Pipeline
     pipeline = MASCCSCPipeline(
