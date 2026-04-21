@@ -10,13 +10,58 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def _ensure_cuda_runtime_env():
+    env = os.environ.copy()
+    updated = False
+
+    required_lib_dirs = [
+        "/home/bkai/anaconda3/envs/cwq_masc_csc/lib",
+        "/home/bkai/anaconda3/envs/cwq_masc_csc/lib/python3.10/site-packages/nvidia/cusparse/lib",
+        "/home/bkai/anaconda3/envs/cwq_masc_csc/lib/python3.10/site-packages/nvidia/cuda_runtime/lib",
+    ]
+    current_ld = env.get("LD_LIBRARY_PATH", "")
+    ld_parts = [part for part in current_ld.split(":") if part]
+    for lib_dir in reversed(required_lib_dirs):
+        if lib_dir and lib_dir not in ld_parts:
+            ld_parts.insert(0, lib_dir)
+            updated = True
+    env["LD_LIBRARY_PATH"] = ":".join(ld_parts)
+
+    current_pythonpath = env.get("PYTHONPATH", "")
+    py_parts = [part for part in current_pythonpath.split(":") if part]
+    if "/home/bkai/cwq/packages" not in py_parts:
+        py_parts.insert(0, "/home/bkai/cwq/packages")
+        env["PYTHONPATH"] = ":".join(py_parts)
+        updated = True
+
+    if env.get("TOKENIZERS_PARALLELISM") != "false":
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        updated = True
+
+    if updated and env.get("MASC_ROUTER_ENV_READY") != "1":
+        env["MASC_ROUTER_ENV_READY"] = "1"
+        os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+
+    os.environ.update(
+        {
+            "LD_LIBRARY_PATH": env["LD_LIBRARY_PATH"],
+            "PYTHONPATH": env.get("PYTHONPATH", ""),
+            "TOKENIZERS_PARALLELISM": env["TOKENIZERS_PARALLELISM"],
+            "MASC_ROUTER_ENV_READY": env.get("MASC_ROUTER_ENV_READY", "0"),
+        }
+    )
+
+
+_ensure_cuda_runtime_env()
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
 from masc_csc.candidate_generator import MechanismAwareCandidateGenerator
 from masc_csc.llm_verifier import BaichuanLocalVerifier
@@ -50,8 +95,8 @@ def parse_args():
     parser.add_argument('--llm-adapter', type=str, default=None,
                         help='可选的 LoRA adapter 路径。')
     parser.add_argument('--llm-mode', type=str, default='targeted', choices=['targeted', 'choice'])
-    parser.add_argument('--targeted-stage', type=str, default='full', choices=['full', 'stage1_only'],
-                        help='当 llm-mode=targeted 时，指定 verifier 执行 full（三阶段）或 stage1_only。')
+    parser.add_argument('--targeted-stage', type=str, default='full', choices=['full', 'stage1_only', 'unified'],
+                        help='当 llm-mode=targeted 时，指定 verifier 执行 full（三阶段）、stage1_only 或 unified（单阶段候选优先+生成补充）。')
     parser.add_argument('--label-mode', type=str, default='llm-gain', choices=['llm-gain', 'frontend-error'],
                         help='llm-gain: 学习 LLM 净收益；frontend-error: 旧版前端错误检测基线。')
     parser.add_argument('--top-k', type=int, default=5)

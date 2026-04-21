@@ -3,6 +3,7 @@ Generate pipeline-aligned staged LLM LoRA training data.
 
 Supported stages:
 - stage1: closed-choice with abstention (A/B/C/.../N)
+- unified: single-stage candidate-first decision (A/B/C/... or GEN:字)
 - stage2: restricted open repair (single-char proposal)
 - stage3: closed-choice re-check after a proposed new char is introduced
 """
@@ -75,7 +76,7 @@ def parse_args():
         "--task-stage",
         type=str,
         default="stage1",
-        choices=["stage1", "stage2", "stage3"],
+        choices=["stage1", "unified", "stage2", "stage3"],
         help="生成哪一阶段的训练数据",
     )
     parser.add_argument("--router-ckpt", type=str, default=None, help="Selective router checkpoint，可选")
@@ -321,6 +322,56 @@ def build_targeted_prompt(
         "请按顺序输出每个可疑位置的选项字母，用逗号分隔。\n"
         "严格只输出字母和逗号，不要解释，不要输出序号、空格或其他任何文字。\n"
         "输出示例：A,B,C\n\n"
+        "输出："
+    )
+
+
+def build_unified_prompt_from_sample(
+    source_text: str,
+    suspicious_indices: List[int],
+    option_lists: List[List[str]],
+) -> str:
+    source_chars = list(source_text)
+    suspicious_set = set(suspicious_indices)
+    display_chars = []
+    for i, char in enumerate(source_chars):
+        display_chars.append(f"[{char}]" if i in suspicious_set else char)
+    display_sentence = " ".join(display_chars)
+
+    position_blocks = []
+    for rank, (index, options) in enumerate(zip(suspicious_indices, option_lists), 1):
+        char = source_chars[index] if 0 <= index < len(source_chars) else "?"
+        option_lines = []
+        for option_index, token in enumerate(options):
+            label = string.ascii_uppercase[option_index]
+            if token == char:
+                option_lines.append(f"    {label}. 保持原字：{token}")
+            else:
+                option_lines.append(f"    {label}. 改为：{token}")
+        position_blocks.append(
+            f"[{rank}] 第{index + 1}字\"{char}\"\n"
+            f"{chr(10).join(option_lines)}"
+        )
+
+    return (
+        "统一决策阶段：以下句子中只有标记位置可能存在拼写错误。\n"
+        "你是中文拼写纠错验证器，不是改写器。\n"
+        "你的目标是对每个位置一次性做出最终决定。\n\n"
+        "动作规则：\n"
+        "1. 如果给定候选中已经有正确答案，必须直接输出对应选项字母。\n"
+        "2. 只有当所有候选都不合适，并且该位置确实存在拼写错误时，才能输出 GEN:汉字。\n"
+        "3. 禁止同义替换、风格润色、专名改写、代词性别替换、异体字/规范字替换。\n"
+        "4. 除标记位置外，不要改动任何其他字符。\n"
+        "5. 如果原字就是正确答案，请选择“保持原字”的那个候选字母，不要输出 KEEP。\n\n"
+        f"句子：{display_sentence}\n\n"
+        "可疑位置与候选：\n"
+        f"{chr(10).join(position_blocks)}\n\n"
+        "输出格式：按顺序输出每个位置的最终决策，用逗号分隔。\n"
+        "合法格式只有两种：\n"
+        "- 直接输出候选字母，例如 A 或 B\n"
+        "- 输出 GEN:汉字，例如 GEN:座\n\n"
+        "输出示例：A,B,GEN:座\n"
+        "严格只输出最终结果，不要解释，不要输出序号、空格或其他任何文字。\n\n"
         "输出："
     )
 
@@ -677,6 +728,121 @@ def materialize_stage1_v3_sample(sample: dict, sample_type: str) -> dict:
     return result
 
 
+def _label_to_unified_action(
+    label: str,
+    option_list: List[str],
+    target_text: str,
+    index: int,
+) -> Optional[str]:
+    label = str(label).strip().upper()
+    if not label:
+        return None
+    if label == "N":
+        if not (0 <= index < len(target_text)):
+            return None
+        gold_char = target_text[index]
+        if not is_single_chinese_char(gold_char):
+            return None
+        return f"GEN:{gold_char}"
+    if label in string.ascii_uppercase:
+        option_index = string.ascii_uppercase.index(label)
+        if option_index < len(option_list):
+            return label
+    return None
+
+
+def materialize_unified_sample(sample: dict) -> Optional[dict]:
+    source_text = sample["source"]
+    target_text = sample["target"]
+    suspicious_indices = list(sample.get("suspicious_indices", []))
+    option_lists = copy.deepcopy(sample.get("option_lists", []))
+    labels = _split_labels(sample)
+    if not suspicious_indices or not option_lists or len(suspicious_indices) != len(option_lists):
+        return None
+
+    actions: List[str] = []
+    num_generate = 0
+    for idx, option_list, label in zip(suspicious_indices, option_lists, labels):
+        action = _label_to_unified_action(label, option_list, target_text, idx)
+        if action is None:
+            return None
+        if action.startswith("GEN:"):
+            num_generate += 1
+        actions.append(action)
+
+    prompt = build_unified_prompt_from_sample(
+        source_text=source_text,
+        suspicious_indices=suspicious_indices,
+        option_lists=option_lists,
+    )
+    num_non_keep = sum(1 for action in actions if action != "A")
+    return {
+        "task_type": "targeted_unified",
+        "instruction": "请完成中文拼写纠错的统一单阶段验证；优先选择候选，候选都不合适时才输出 GEN:字。",
+        "input": prompt,
+        "output": ",".join(actions),
+        "source": source_text,
+        "target": target_text,
+        "frontend_prediction": sample.get("frontend_prediction", sample.get("predicted_text", "")),
+        "num_positions": len(actions),
+        "num_non_keep": num_non_keep,
+        "num_generate": num_generate,
+        "all_keep": num_non_keep == 0,
+        "sample_label": 0 if num_non_keep == 0 else 1,
+        "suspicious_indices": suspicious_indices,
+        "option_lists": option_lists,
+        "sample_type": sample.get("sample_type", "unknown"),
+        "contains_gen": num_generate > 0,
+        "task_stage": "unified",
+        "router_invoke": bool(sample.get("router_invoke", False)),
+        "router_risk": sample.get("router_risk"),
+        "router_reasons": list(sample.get("router_reasons", [])),
+    }
+
+
+def summarize_unified_samples(samples: List[dict], raw_counts: dict) -> dict:
+    action_counter = {"A": 0, "B": 0, "C": 0, "D": 0, "GEN": 0}
+    sample_type_counter = {}
+    num_positions_counter = {}
+    contains_gen_counter = {"true": 0, "false": 0}
+    router_invoke_counter = {"true": 0, "false": 0}
+
+    total_positions = 0
+    for sample in samples:
+        sample_type = sample.get("sample_type", "unknown")
+        sample_type_counter[sample_type] = sample_type_counter.get(sample_type, 0) + 1
+        num_positions = int(sample.get("num_positions", 0))
+        num_positions_counter[str(num_positions)] = num_positions_counter.get(str(num_positions), 0) + 1
+        contains_gen_counter["true" if sample.get("contains_gen") else "false"] += 1
+        router_invoke_counter["true" if sample.get("router_invoke") else "false"] += 1
+        actions = [act for act in str(sample.get("output", "")).split(",") if act]
+        total_positions += len(actions)
+        for act in actions:
+            if act.startswith("GEN:"):
+                action_counter["GEN"] += 1
+            elif act in action_counter:
+                action_counter[act] += 1
+            else:
+                action_counter.setdefault(act, 0)
+                action_counter[act] += 1
+
+    action_ratio = {
+        action: (count / total_positions if total_positions else 0.0)
+        for action, count in action_counter.items()
+    }
+    return {
+        "raw_counts": raw_counts,
+        "final_num_samples": len(samples),
+        "final_total_positions": total_positions,
+        "sample_type_counter": sample_type_counter,
+        "num_positions_counter": num_positions_counter,
+        "contains_gen_counter": contains_gen_counter,
+        "router_invoke_counter": router_invoke_counter,
+        "action_counter": action_counter,
+        "action_ratio": action_ratio,
+    }
+
+
 def classify_stage1_v3_sample(sample: dict) -> Optional[str]:
     if not bool(sample.get("router_invoke", False)):
         return None
@@ -973,7 +1139,7 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.task_stage == "stage1":
+    if args.task_stage in {"stage1", "unified"}:
         if args.stage1_rebuild_from:
             rebuild_path = Path(args.stage1_rebuild_from)
             if not rebuild_path.exists():
@@ -981,27 +1147,46 @@ def main():
             with open(rebuild_path, "r", encoding="utf-8") as fin:
                 rebuild_samples = [json.loads(line) for line in fin if line.strip()]
             total = len(rebuild_samples)
-            if args.stage1_build_mode != "v3":
-                raise ValueError("当前从已有 stage1 JSONL 重构仅支持 --stage1-build-mode v3")
-            stage1_samples, stage1_summary = build_stage1_v3_dataset_from_samples(rebuild_samples, args)
+            if args.task_stage == "stage1":
+                if args.stage1_build_mode != "v3":
+                    raise ValueError("当前从已有 stage1 JSONL 重构仅支持 --stage1-build-mode v3")
+                final_samples, final_summary = build_stage1_v3_dataset_from_samples(rebuild_samples, args)
+                generation_mode = "stage1-v3"
+            else:
+                final_samples = []
+                skipped_unified_invalid = 0
+                for sample in rebuild_samples:
+                    unified_sample = materialize_unified_sample(sample)
+                    if unified_sample is None:
+                        skipped_unified_invalid += 1
+                        continue
+                    final_samples.append(unified_sample)
+                final_summary = summarize_unified_samples(
+                    final_samples,
+                    raw_counts={
+                        "raw_total": len(rebuild_samples),
+                        "raw_invalid_skipped": skipped_unified_invalid,
+                    },
+                )
+                generation_mode = "unified-rebuild"
             with open(output_path, "w", encoding="utf-8") as fout:
-                for sample in stage1_samples:
+                for sample in final_samples:
                     fout.write(json.dumps(_sanitize_for_json(sample), ensure_ascii=False) + "\n")
             summary_path = Path(str(output_path) + ".summary.json")
             full_summary = {
-                "task_stage": "stage1",
-                "generation_mode": "stage1-v3",
+                "task_stage": args.task_stage,
+                "generation_mode": generation_mode,
                 "rebuild_from": str(rebuild_path),
                 "total_records_seen": total,
-                "saved": len(stage1_samples),
-                "stage1_summary": stage1_summary,
+                "saved": len(final_samples),
+                "summary": final_summary,
             }
             with open(summary_path, "w", encoding="utf-8") as f:
                 json.dump(_sanitize_for_json(full_summary), f, ensure_ascii=False, indent=2)
 
-            print("\n[*] Stage1 rebuild completed:")
+            print(f"\n[*] {args.task_stage} rebuild completed:")
             print(f"  Source samples: {total}")
-            print(f"  Saved: {len(stage1_samples)}")
+            print(f"  Saved: {len(final_samples)}")
             print(f"  Summary: {summary_path}")
             return
 
@@ -1050,36 +1235,60 @@ def main():
 
         if args.stage1_build_mode == "v2":
             stage1_samples, stage1_summary = build_stage1_v2_dataset(stage1_instances, args)
-            generation_mode = "stage1-v2"
+            base_generation_mode = "stage1-v2"
         else:
             base_stage1_samples = [
                 materialize_stage1_sample(instance, sample_type="raw-stage1")
                 for instance in stage1_instances
             ]
             stage1_samples, stage1_summary = build_stage1_v3_dataset_from_samples(base_stage1_samples, args)
-            generation_mode = "stage1-v3"
-        with open(output_path, "w", encoding="utf-8") as fout:
+            base_generation_mode = "stage1-v3"
+
+        if args.task_stage == "stage1":
+            final_samples = stage1_samples
+            final_summary = stage1_summary
+            generation_mode = base_generation_mode
+        else:
+            unified_samples: List[dict] = []
+            skipped_unified_invalid = 0
             for sample in stage1_samples:
+                unified_sample = materialize_unified_sample(sample)
+                if unified_sample is None:
+                    skipped_unified_invalid += 1
+                    continue
+                unified_samples.append(unified_sample)
+            final_samples = unified_samples
+            final_summary = summarize_unified_samples(
+                unified_samples,
+                raw_counts={
+                    "base_generation_mode": base_generation_mode,
+                    "base_saved": len(stage1_samples),
+                    "base_skipped_unified_invalid": skipped_unified_invalid,
+                },
+            )
+            generation_mode = f"unified-from-{base_generation_mode}"
+        with open(output_path, "w", encoding="utf-8") as fout:
+            for sample in final_samples:
                 safe_sample = _sanitize_for_json(sample)
                 fout.write(json.dumps(safe_sample, ensure_ascii=False) + "\n")
         summary_path = Path(str(output_path) + ".summary.json")
         full_summary = {
-            "task_stage": "stage1",
+            "task_stage": args.task_stage,
             "generation_mode": generation_mode,
             "total_records_seen": total,
-            "saved": len(stage1_samples),
+            "saved": len(final_samples),
             "skipped_len": skipped_len,
             "skipped_skip": skipped_skip,
             "skipped_no_positions": skipped_no_positions,
             "skipped_stage_empty": skipped_stage_empty,
-            "stage1_summary": stage1_summary,
+            "summary": final_summary,
         }
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(_sanitize_for_json(full_summary), f, ensure_ascii=False, indent=2)
 
         print(f"\n[*] {generation_mode} generation completed:")
         print(f"  Total processed: {total}")
-        print(f"  Saved: {len(stage1_samples)}")
+        print(f"  Saved: {len(final_samples)}")
         print(f"  Summary: {summary_path}")
         return
 

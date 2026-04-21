@@ -30,20 +30,66 @@ MASC-CSC 全流程运行脚本
 import argparse
 import csv
 import json
+import logging
 import os
 import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import torch
-import logging
 logging.basicConfig(level=logging.INFO)
 
 # 设置项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def _ensure_cuda_runtime_env():
+    env = os.environ.copy()
+    updated = False
+
+    required_lib_dirs = [
+        "/home/bkai/anaconda3/envs/cwq_masc_csc/lib",
+        "/home/bkai/anaconda3/envs/cwq_masc_csc/lib/python3.10/site-packages/nvidia/cusparse/lib",
+        "/home/bkai/anaconda3/envs/cwq_masc_csc/lib/python3.10/site-packages/nvidia/cuda_runtime/lib",
+    ]
+    current_ld = env.get("LD_LIBRARY_PATH", "")
+    ld_parts = [part for part in current_ld.split(":") if part]
+    for lib_dir in reversed(required_lib_dirs):
+        if lib_dir and lib_dir not in ld_parts:
+            ld_parts.insert(0, lib_dir)
+            updated = True
+    env["LD_LIBRARY_PATH"] = ":".join(ld_parts)
+
+    current_pythonpath = env.get("PYTHONPATH", "")
+    py_parts = [part for part in current_pythonpath.split(":") if part]
+    if "/home/bkai/cwq/packages" not in py_parts:
+        py_parts.insert(0, "/home/bkai/cwq/packages")
+        env["PYTHONPATH"] = ":".join(py_parts)
+        updated = True
+
+    if env.get("TOKENIZERS_PARALLELISM") != "false":
+        env["TOKENIZERS_PARALLELISM"] = "false"
+        updated = True
+
+    if updated and env.get("MASC_PIPELINE_ENV_READY") != "1":
+        env["MASC_PIPELINE_ENV_READY"] = "1"
+        os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+
+    os.environ.update(
+        {
+            "LD_LIBRARY_PATH": env["LD_LIBRARY_PATH"],
+            "PYTHONPATH": env.get("PYTHONPATH", ""),
+            "TOKENIZERS_PARALLELISM": env["TOKENIZERS_PARALLELISM"],
+            "MASC_PIPELINE_ENV_READY": env.get("MASC_PIPELINE_ENV_READY", "0"),
+        }
+    )
+
+
+_ensure_cuda_runtime_env()
+
+import torch
 
 os.environ["MASC_SKIP_GLYPH_CACHE"] = "1"
 
@@ -91,8 +137,8 @@ def parse_args():
                         choices=["targeted", "choice"],
                         help="LLM 工作模式: targeted(定点纠正) / choice(选择题)")
     parser.add_argument("--targeted-stage", type=str, default="full",
-                        choices=["full", "stage1_only"],
-                        help="targeted 模式下的执行阶段：full(默认三阶段) / stage1_only(只跑 stage1，N 直接回退原字)")
+                        choices=["full", "stage1_only", "unified"],
+                        help="targeted 模式下的执行阶段：full(默认三阶段) / stage1_only(只跑 stage1，N 直接回退原字) / unified(单阶段候选优先+生成补充)")
     parser.add_argument("--no-llm", action="store_true",
                         help="禁用 LLM，即使 Router 判定需要也跳过")
 

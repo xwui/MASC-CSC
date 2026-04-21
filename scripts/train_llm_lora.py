@@ -323,6 +323,14 @@ def _infer_instruction_sample_label(example) -> int:
         if not labels:
             return -1
         return 0 if all(label == "A" for label in labels) else 1
+    if task_type == "targeted_unified":
+        output = str(example.get("output", "")).replace("，", ",").strip()
+        if not output:
+            return -1
+        actions = [item.strip() for item in output.split(",") if item.strip()]
+        if not actions:
+            return -1
+        return 0 if all(action.upper() == "A" for action in actions) else 1
     if task_type == "targeted_open_repair":
         output = str(example.get("output", "")).strip()
         source_char = str(example.get("source_char", "")).strip()

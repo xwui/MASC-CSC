@@ -204,6 +204,7 @@ def parse_args():
             "choice",
             "targeted_choice",
             "targeted_choice_abstain",
+            "targeted_unified",
             "targeted_open_repair",
             "targeted_recheck",
         ],
@@ -276,6 +277,8 @@ def detect_task_type(sample: dict, user_task_type: str) -> str:
         return "targeted_choice"
     if task_type == "targeted_choice_abstain":
         return "targeted_choice_abstain"
+    if task_type == "targeted_unified":
+        return "targeted_unified"
     if task_type == "targeted_open_repair":
         return "targeted_open_repair"
     if task_type == "targeted_recheck":
@@ -375,6 +378,39 @@ def parse_targeted_choice_prediction(text: str) -> Tuple[Optional[str], str]:
     if not labels:
         return None, normalized
     return ",".join(labels), normalized
+
+
+def parse_targeted_unified_prediction(text: str, expected_count: int) -> Tuple[Optional[str], str]:
+    normalized = unicodedata.normalize("NFKC", normalize_generation(text))
+    normalized = normalized.replace("，", ",").strip()
+    raw_segments = [seg.strip() for seg in normalized.replace("\n", ",").split(",") if seg.strip()]
+    parsed_segments: List[str] = []
+    seg_idx = 0
+
+    for _ in range(expected_count):
+        action: Optional[str] = None
+        while seg_idx < len(raw_segments):
+            seg = raw_segments[seg_idx]
+            seg_idx += 1
+            upper_seg = seg.upper()
+            if "GEN" in upper_seg or "生成" in seg:
+                chinese_char = next((ch for ch in seg if "\u4e00" <= ch <= "\u9fff"), None)
+                if chinese_char is not None:
+                    action = f"GEN:{chinese_char}"
+                    break
+            label = next((ch for ch in upper_seg if ch in string.ascii_uppercase), None)
+            if label is not None:
+                action = label
+                break
+            chinese_char = next((ch for ch in seg if "\u4e00" <= ch <= "\u9fff"), None)
+            if chinese_char is not None:
+                action = f"GEN:{chinese_char}"
+                break
+        if action is None:
+            return None, normalized
+        parsed_segments.append(action)
+
+    return ",".join(parsed_segments), normalized
 
 
 def parse_single_char_prediction(text: str) -> Tuple[Optional[str], str]:
@@ -615,6 +651,74 @@ def evaluate_targeted_choice_abstain(records: List[dict], model, tokenizer, max_
     return metrics, predictions, errors
 
 
+def evaluate_targeted_unified(records: List[dict], model, tokenizer, max_new_tokens: int, print_every: int):
+    predictions = []
+    errors = []
+    exact_correct = 0
+    invalid = 0
+    total_positions = 0
+    correct_positions = 0
+    total_generated = 0
+    correct_generated = 0
+    predicted_generated = 0
+
+    for idx, example in enumerate(tqdm(records, desc="Evaluating targeted_unified"), start=1):
+        prompt = build_targeted_choice_prompt(example)
+        expected_count = int(example.get("num_positions", 0)) or len([x for x in str(example.get("output", "")).split(",") if x])
+        raw_output = generate_text(model, tokenizer, prompt, max_new_tokens=min(max_new_tokens, max(16, 8 * max(1, expected_count))))
+        pred_seq, normalized_output = parse_targeted_unified_prediction(raw_output, expected_count=expected_count)
+        gold_seq = str(example["output"]).replace("，", ",").replace(" ", "").strip()
+        is_correct = pred_seq == gold_seq
+
+        gold_actions = [x for x in gold_seq.split(",") if x]
+        pred_actions = [x for x in (pred_seq.split(",") if pred_seq else []) if x]
+        total_positions += len(gold_actions)
+        correct_positions += sum(1 for g, p in zip(gold_actions, pred_actions) if g == p)
+        total_generated += sum(1 for action in gold_actions if action.startswith("GEN:"))
+        correct_generated += sum(1 for g, p in zip(gold_actions, pred_actions) if g.startswith("GEN:") and p == g)
+        predicted_generated += sum(1 for action in pred_actions if action.startswith("GEN:"))
+
+        if pred_seq is None:
+            invalid += 1
+        if is_correct:
+            exact_correct += 1
+
+        item = {
+            "instruction": example.get("instruction", ""),
+            "input": example.get("input", ""),
+            "gold": gold_seq,
+            "prediction": pred_seq,
+            "raw_output": raw_output,
+            "normalized_output": normalized_output,
+            "correct": is_correct,
+            "num_positions": example.get("num_positions"),
+            "num_non_keep": example.get("num_non_keep"),
+            "num_generate": example.get("num_generate"),
+            "all_keep": example.get("all_keep"),
+        }
+        predictions.append(item)
+        if not is_correct:
+            errors.append(item)
+
+        if print_every > 0 and idx % print_every == 0:
+            print(f"[{idx}] gold={gold_seq} pred={pred_seq} raw={raw_output}")
+
+    total = len(records)
+    generate_precision = correct_generated / predicted_generated if predicted_generated > 0 else 0.0
+    generate_recall = correct_generated / total_generated if total_generated > 0 else 0.0
+    metrics = {
+        "task_type": "targeted_unified",
+        "num_samples": total,
+        "exact_correct": exact_correct,
+        "invalid_predictions": invalid,
+        "sequence_accuracy": exact_correct / total if total > 0 else 0.0,
+        "position_accuracy": correct_positions / total_positions if total_positions > 0 else 0.0,
+        "generate_precision": generate_precision,
+        "generate_recall": generate_recall,
+    }
+    return metrics, predictions, errors
+
+
 def evaluate_targeted_open_repair(records: List[dict], model, tokenizer, max_new_tokens: int, print_every: int):
     predictions = []
     errors = []
@@ -845,6 +949,14 @@ def main():
         )
     elif task_type == "targeted_choice_abstain":
         metrics, predictions, errors = evaluate_targeted_choice_abstain(
+            records=records,
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=args.max_new_tokens,
+            print_every=args.print_every,
+        )
+    elif task_type == "targeted_unified":
+        metrics, predictions, errors = evaluate_targeted_unified(
             records=records,
             model=model,
             tokenizer=tokenizer,

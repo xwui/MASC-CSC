@@ -9,3 +9,7 @@ logs/
 *.pyc
 
 LLM/
+
+*.jsonl
+
+*.json

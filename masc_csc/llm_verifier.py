@@ -11,6 +11,7 @@ MASC-CSC Local LLM Verifier
 """
 
 import logging
+import re
 import string
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -134,6 +135,16 @@ class StageTwoProposal:
     raw_output: str
 
 
+@dataclass
+class UnifiedDecision:
+    position: PositionPrediction
+    options: List[str]
+    selected_token: Optional[str]
+    generated_char: Optional[str]
+    used_generation: bool
+    raw_segment: str
+
+
 # ──────────────────────────────────────────────────────────
 # 3. NoOp 验证器 (无 LLM 时的降级方案，保持不变)
 # ──────────────────────────────────────────────────────────
@@ -208,11 +219,11 @@ class BaichuanLocalVerifier:
             torch_dtype: 模型精度 (torch.float16 / torch.bfloat16)
             max_new_tokens: 生成的最大 token 数（choice 模式下为 1）
             mode: 工作模式，"choice"（选择题）或 "targeted"（定点纠正）
-            targeted_stage: targeted 模式下执行 "full"（三阶段）或 "stage1_only"（只跑 stage1）
+            targeted_stage: targeted 模式下执行 "full"（三阶段）、"stage1_only"（只跑 stage1）或 "unified"（单阶段候选优先+生成补充）
         """
         assert mode in ("choice", "targeted"), f"mode 必须是 'choice' 或 'targeted'，收到: {mode}"
-        assert targeted_stage in ("full", "stage1_only"), \
-            f"targeted_stage 必须是 'full' 或 'stage1_only'，收到: {targeted_stage}"
+        assert targeted_stage in ("full", "stage1_only", "unified"), \
+            f"targeted_stage 必须是 'full'、'stage1_only' 或 'unified'，收到: {targeted_stage}"
 
         logger.info("Loading LLM model from: %s (mode=%s)", model_path, mode)
         self.device = device
@@ -242,10 +253,10 @@ class BaichuanLocalVerifier:
                 from peft import PeftModel
                 self.model = PeftModel.from_pretrained(self.model, adapter_path)
                 logger.info("LoRA adapter loaded successfully.")
-            except ImportError:
-                logger.warning("peft not installed, skipping LoRA adapter loading.")
             except Exception as e:
-                logger.warning("Failed to load LoRA adapter: %s", e)
+                raise RuntimeError(
+                    f"Failed to load LoRA adapter from {adapter_path}: {e}"
+                ) from e
 
         self.model.eval()
 
@@ -318,7 +329,7 @@ class BaichuanLocalVerifier:
         generate_kwargs = dict(
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            temperature=0.001,
+            temperature=0.01,
             top_p=1.0,
             top_k=50,
             repetition_penalty=1.0,
@@ -624,6 +635,158 @@ class BaichuanLocalVerifier:
                     break
             labels.append(chosen_label)
         return labels
+
+    def _build_unified_targeted_prompt(
+            self,
+            prediction: SentencePrediction,
+            suspicious_positions: List[PositionPrediction],
+            option_lists: List[List[str]],
+    ) -> str:
+        """
+        单阶段统一决策：
+        - 优先从候选里选（输出 A/B/C...）
+        - 如果候选都不合适，再输出 GEN:汉字
+        """
+        source_text = prediction.source_text
+        source_chars = list(source_text)
+        suspicious_indices = set(p.index for p in suspicious_positions)
+
+        display_chars = []
+        for i, char in enumerate(source_chars):
+            display_chars.append(f"[{char}]" if i in suspicious_indices else char)
+        display_sentence = " ".join(display_chars)
+
+        position_blocks = []
+        for rank, (pos, options) in enumerate(zip(suspicious_positions, option_lists), 1):
+            idx = pos.index
+            char = source_chars[idx] if idx < len(source_chars) else "?"
+            option_lines = []
+            for option_index, token in enumerate(options):
+                label = self._label(option_index)
+                if token == pos.source_token:
+                    option_lines.append(f"    {label}. 保持原字：{token}")
+                else:
+                    option_lines.append(f"    {label}. 改为：{token}")
+            position_blocks.append(
+                f"[{rank}] 第{idx + 1}字\"{char}\"\n"
+                f"{chr(10).join(option_lines)}"
+            )
+
+        prompt = (
+            "统一决策阶段：以下句子中只有标记位置可能存在拼写错误。\n"
+            "你是中文拼写纠错验证器，不是改写器。\n"
+            "你的目标是对每个位置一次性做出最终决定。\n\n"
+            "动作规则：\n"
+            "1. 如果给定候选中已经有正确答案，必须直接输出对应选项字母。\n"
+            "2. 只有当所有候选都不合适，并且该位置确实存在拼写错误时，才能输出 GEN:汉字。\n"
+            "3. 禁止同义替换、风格润色、专名改写、代词性别替换、异体字/规范字替换。\n"
+            "4. 除标记位置外，不要改动任何其他字符。\n"
+            "5. 如果原字就是正确答案，请选择“保持原字”的那个候选字母，不要输出 KEEP。\n\n"
+            f"句子：{display_sentence}\n\n"
+            "可疑位置与候选：\n"
+            f"{chr(10).join(position_blocks)}\n\n"
+            "输出格式：按顺序输出每个位置的最终决策，用逗号分隔。\n"
+            "合法格式只有两种：\n"
+            "- 直接输出候选字母，例如 A 或 B\n"
+            "- 输出 GEN:汉字，例如 GEN:座\n\n"
+            "输出示例：A,B,GEN:座\n"
+            "严格只输出最终结果，不要解释，不要输出序号、空格或其他任何文字。\n\n"
+            "输出："
+        )
+        return prompt
+
+    def _parse_unified_sequence(
+            self,
+            generated_text: str,
+            expected_count: int,
+    ) -> List[Tuple[Optional[str], Optional[str], str]]:
+        """
+        解析单阶段 unified 输出。
+
+        返回:
+        - option_label: 选中的候选字母
+        - generated_char: 生成的单字
+        - raw_segment: 原始片段
+        """
+        text = generated_text.replace("，", ",").strip()
+        segments = [seg.strip() for seg in re.split(r"[,\n]+", text) if seg.strip()]
+        results: List[Tuple[Optional[str], Optional[str], str]] = []
+        seg_idx = 0
+
+        for _ in range(expected_count):
+            option_label: Optional[str] = None
+            generated_char: Optional[str] = None
+            raw_segment = ""
+
+            while seg_idx < len(segments):
+                raw_segment = segments[seg_idx]
+                seg_idx += 1
+                upper_segment = raw_segment.upper()
+
+                if "GEN" in upper_segment or "生成" in raw_segment:
+                    chinese_char = self._first_chinese_char(raw_segment)
+                    if chinese_char is not None:
+                        generated_char = chinese_char
+                    break
+
+                label_match = next((ch for ch in upper_segment if ch in string.ascii_uppercase), None)
+                if label_match is not None:
+                    option_label = label_match
+                    break
+
+                chinese_char = self._first_chinese_char(raw_segment)
+                if chinese_char is not None:
+                    generated_char = chinese_char
+                    break
+
+            results.append((option_label, generated_char, raw_segment))
+        return results
+
+    def _run_unified_targeted(
+            self,
+            prediction: SentencePrediction,
+            active_positions: List[PositionPrediction],
+            option_lists: List[List[str]],
+    ) -> List[UnifiedDecision]:
+        prompt = self._build_unified_targeted_prompt(
+            prediction,
+            active_positions,
+            option_lists,
+        )
+        inputs = self._prepare_prompt_inputs(prompt)
+        max_tokens = max(4, 8 * len(active_positions))
+        _, generated_text = self._generate_text(
+            inputs,
+            max_new_tokens=max_tokens,
+            logits_processor=None,
+        )
+        logger.info("Unified targeted output: %s", generated_text)
+
+        parsed = self._parse_unified_sequence(generated_text, len(active_positions))
+        decisions: List[UnifiedDecision] = []
+        for pos, options, (label, generated_char, raw_segment) in zip(active_positions, option_lists, parsed):
+            selected_token = None
+            used_generation = False
+
+            if label is not None:
+                option_index = string.ascii_uppercase.index(label)
+                if option_index < len(options):
+                    selected_token = options[option_index]
+
+            if selected_token is None and generated_char is not None:
+                used_generation = True
+
+            decisions.append(
+                UnifiedDecision(
+                    position=pos,
+                    options=options,
+                    selected_token=selected_token,
+                    generated_char=generated_char,
+                    used_generation=used_generation,
+                    raw_segment=raw_segment,
+                )
+            )
+        return decisions
 
     def _run_stage1(
             self,
@@ -962,6 +1125,47 @@ class BaichuanLocalVerifier:
                 active_options.append(options)
 
         if active_positions:
+            if self.targeted_stage == "unified":
+                unified_decisions = self._run_unified_targeted(
+                    prediction,
+                    active_positions,
+                    active_options,
+                )
+                candidate_pick = 0
+                generated_pick = 0
+                fallback_keep = 0
+                for decision in unified_decisions:
+                    if decision.selected_token is not None:
+                        correction_map[decision.position.index] = decision.selected_token
+                        decision_reasons[decision.position.index] = 'accepted_unified_choice'
+                        candidate_pick += 1
+                    elif decision.generated_char is not None:
+                        correction_map[decision.position.index] = decision.generated_char
+                        decision_reasons[decision.position.index] = 'accepted_unified_generation'
+                        generated_pick += 1
+                    else:
+                        correction_map[decision.position.index] = decision.position.source_token
+                        decision_reasons[decision.position.index] = 'unified_parse_fallback_keep'
+                        fallback_keep += 1
+
+                corrections = [
+                    correction_map.get(pos.index, pos.predicted_token if pos.is_edited else pos.source_token)
+                    for pos in suspicious_positions
+                ]
+                result = self._safe_merge_targeted_corrections(
+                    prediction,
+                    candidates,
+                    suspicious_positions,
+                    corrections,
+                    decision_reasons=decision_reasons,
+                )
+                result.reason = (
+                    f"Unified verifier: candidate_pick={candidate_pick}, "
+                    f"generated={generated_pick}, fallback_keep={fallback_keep}. {result.reason}"
+                )
+                result.selected_source = 'llm-targeted-unified'
+                return result
+
             stage1_decisions = self._run_stage1(prediction, active_positions, active_options)
             for decision in stage1_decisions:
                 if decision.abstained:
@@ -1056,9 +1260,17 @@ class BaichuanLocalVerifier:
         if self.mode == "choice":
             return self._build_choice_prompt(prediction, candidates)
         suspicious = self._get_suspicious_positions(prediction)
+        option_lists = [self._build_targeted_options(pos) for pos in suspicious]
+        if self.targeted_stage == "unified":
+            return self._build_unified_targeted_prompt(
+                prediction,
+                suspicious,
+                option_lists,
+            )
         return self._build_targeted_prompt(
             prediction,
             suspicious,
+            option_lists=option_lists,
             allow_abstain=True,
             stage_name="第一阶段",
         )
